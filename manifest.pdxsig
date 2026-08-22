@@ -1,0 +1,163 @@
+# cat — manifest.pdxsig
+#
+# Dual-signed package manifest for `cat` v1.0.
+#
+# Wave:  R50
+# Doc:   design/tooling/plan.md §D4 + §6.2 + §6.3 + §6.4 (paideia-os).
+#        The invariant: every shipping tool ships as a package with a
+#        two-key ML-DSA-65 dual signature — the author key
+#        (paideia-os-team for this first-party tool) and the Paideia
+#        root re-sign key (paideia_root_pk from R32).
+# Wire:  design/drivers/blob-policy.md §5 (paideia-os) is the closest
+#        prior art for the signature envelope shape. This file is the
+#        text-review-friendly source-form; `paideia-as release --sign`
+#        (per plan.md §9.3) is the tool that produces the on-wire
+#        binary-encoded manifest.pdxsig alongside pkg.tar. Both keep
+#        the same field ordering below so a reviewer can diff the
+#        text form against the binary form's decoded output.
+#
+# ---
+#
+# Substrate posture (Round-2 §5.0 gate reference)
+# -----------------------------------------------
+# The runtime prerequisites for producing REAL cryptographic
+# signatures + REAL sha3-256 content hashes are not landed at HEAD:
+#
+#   - paideia-as v0.33-crypto tag with the ml_dsa_65_{sign,verify}
+#     intrinsic and the sha3_256 primitive is not yet reachable via
+#     the toolchain (referenced from plan.md §D4 and from the
+#     pkg.M2-003 body sketch in r49-r50-plan.md §5.1).
+#   - The svc.signing-bot broker registration + paideia_root_pk
+#     provisioning is deferred to T-INFRA-002 in the paideia-os meta
+#     repo per plan.md §10.
+#   - The pkgs.paideia-os HTTPS package repository host is deferred
+#     to T-INFRA-001 in the paideia-os meta repo per plan.md §10.
+#
+# Consequence: the two `signature_ml_dsa_65:` lines below carry the
+# literal string `PENDING` in place of the 3293-byte ML-DSA-65
+# signature bytes (base64-encoded on the wire) that they will hold
+# once `paideia-as release --sign` re-emits this file over the frozen
+# v1.0 source tree with the real keys. The `content_hashes` block
+# uses sha2-256 today; the on-wire re-emit will replace it with the
+# sha3-256 block declared in plan.md §D4. The `signer_pk_id` lines
+# carry the literal string `PENDING` in place of the 16-byte
+# fingerprint per the shape at design/drivers/blob-policy.md §5.
+#
+# Every OTHER field below is the real v1.0 shape and is invariant
+# across the M5 → v0.33-crypto migration.
+
+# ---------------------------------------------------------------
+# §1 Package identity
+# ---------------------------------------------------------------
+package:
+  name:              cat
+  version:           1.0.0
+  wave:              R50
+  category:          A  # Filesystem + core utilities (plan.md §5)
+  posix_ancestor:    cat
+  release_date:      2026-08-22
+  git_tag:           v1.0.0
+  git_repo:          github.com/paideia-os/cat
+  license:           MIT
+  paideia_as_target: v0.33          # min toolchain for build reproducibility
+
+# ---------------------------------------------------------------
+# §2 Capability manifest reference (I6)
+# ---------------------------------------------------------------
+# The manifest signs OVER the exact caps.decl bytes the shell will
+# validate at exec (invariant I6 in plan.md §4.2). A hash mismatch
+# on install is a signature-bounded refusal path.
+caps_decl:
+  path:              caps.decl
+  hash_sha2_256:     6fecbbcbb808f983013bb43fef6e4eac8f7f187254098c7f33295d79cbcb20c6
+  # hash_sha3_256:  <re-emitted by paideia-as release --sign>
+
+# ---------------------------------------------------------------
+# §3 Dependency manifest reference (§7 / §9.1)
+# ---------------------------------------------------------------
+deps_list:
+  path:              deps.list
+  hash_sha2_256:     958f1923b7bf41869393931e1b056dee33af4c5fa0225580a9bc415554099a77
+  # hash_sha3_256:  <re-emitted by paideia-as release --sign>
+  # v1.0 dep set is empty; see deps.list header for the migration
+  # ledger to the v1.1 dep set once libpdx-* .so bindings arrive.
+
+# ---------------------------------------------------------------
+# §4 Content hashes over the shipped tree
+# ---------------------------------------------------------------
+# On the wire (post v0.33-crypto), each entry carries a sha3_256.
+# In this text-review manifest we carry sha2_256 as an interim
+# integrity witness — the signing bot recomputes both when it
+# produces the on-wire binary form.
+content_hashes:
+  algorithm:         sha2-256          # interim; on-wire uses sha3-256
+  entries:
+    - path: LICENSE
+      hash: 5d10906e3e9407412fd51592e3dd968251a4797b8ffdcc9e862d8fb1f3925e2b
+    - path: src/argv_dispatch.pdx
+      hash: f469c2d1d5eb4566b72f0e671e445ce26f094e26e2722569282d5921b03c575f
+    - path: src/file_read.pdx
+      hash: 156125b2bb9158cce7fbfdc97eaaff2a054734d8c7ec041c825054b37fb4f28f
+    - path: src/render.pdx
+      hash: 66ee1ceb21b277c9c30614972762bc4396201c2ca2c54cd7c14738e83399a618
+    - path: src/tty_sink.pdx
+      hash: bc458b562c5128b6c74a35802edb501d231ef9b1865eb083ec5e32d30aa6a9f0
+    - path: src/stdin_source.pdx
+      hash: 7534a738a743bc98c06ee5325f2a6bd1c258ff62e22b90b486e7cba41e2daac8
+    - path: src/pipe_out.pdx
+      hash: e2fbff6e39e67f2dc3edcda4cbd2bf3f0e5d01da55899445f6a64ba73c1e2736
+    - path: src/file_schema.pdx
+      hash: 386b61957578326cb18137272b2c4bb8aa4b4f5f0cd77d6d19006be76369b43e
+    - path: src/raw_byte_chunk.pdx
+      hash: 37cd03fa05353c4b6abddc5748d907f46367c0db0d144a52b114f6d7f1219c06
+    - path: src/audit_stub.pdx
+      hash: fa54b463e2889a83163dbe77db790ad45e8ebd20cad14ac9d7709154d5089b4e
+
+# ---------------------------------------------------------------
+# §5 Declared output schemas (D2, semantic-pipe)
+# ---------------------------------------------------------------
+# Bound-in at M3-001 / M3-002; carried in the manifest so consumers
+# can inspect what wire records this tool emits before install.
+declared_output_schemas:
+  - name:            RawByteChunk
+    version:         0.1
+    origin:          libpdx-semantic-pipe (schemaless-file path, M3-002)
+  - name:            <inherited from KIND_PDXFS_FILE.schema>
+    origin:          per-file schema (schema-typed passthrough, M3-001)
+
+# ---------------------------------------------------------------
+# §6 Author signature — first of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+# Signs over the concatenation of §1..§5 in canonical byte order.
+# The signer_pk_id is the first 16 bytes of sha3-256(author_pk).
+author_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia-os-team
+  signer_pk_id:      PENDING              # 16-byte fingerprint; T-INFRA-002
+  signature_ml_dsa_65: PENDING            # 3293-byte sig; paideia-as v0.33-crypto
+
+# ---------------------------------------------------------------
+# §7 Root re-signature — second of two ML-DSA-65 signatures
+# ---------------------------------------------------------------
+# The signing bot re-signs the SAME §1..§5 byte range under the
+# paideia_root_pk after human-reviewer confirmation that the source
+# tree at the referenced git_tag matches the author-signed hashes.
+# `pkg install cat` at the user side rejects unless BOTH signatures
+# verify (plan.md §6.2).
+root_signature:
+  algorithm:         ML-DSA-65
+  signer:            paideia_root_pk           # from R32
+  signer_pk_id:      PENDING              # 16-byte fingerprint; T-INFRA-002
+  signature_ml_dsa_65: PENDING            # 3293-byte sig; paideia-as v0.33-crypto
+  countersigned_by:  svc.signing-bot           # T-INFRA-002 broker binding
+  countersigner_note: pending                  # human-review confirmation record
+
+# ---------------------------------------------------------------
+# §8 Substrate-gate refusal witness
+# ---------------------------------------------------------------
+# `pkg install cat` from this v1.0 manifest MUST refuse until BOTH
+# signature blocks carry non-PENDING bytes. Refusal exit code is 4
+# (cap denied per I4 in plan.md §4.2 — the missing cap here is the
+# implicit KIND_SIGNATURE(verify, *) that the manifest cannot satisfy
+# with placeholder bytes). The refusal path is not conditional on the
+# reviewer's discretion; it is an invariant of the two-key policy.

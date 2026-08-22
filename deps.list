@@ -1,0 +1,44 @@
+# cat — deps.list
+#
+# Shared-library dependencies at exec time, as declared by
+# design/tooling/plan.md §9.1 (layout) + §7 (shared libraries).
+# The pkg tool consults this list at install time to resolve the
+# closure of packages required for `cat` to launch.
+#
+# Wave: R50
+#
+# ---
+#
+# v1.0 dep set — NONE.
+# --------------------
+# All six libraries that cat's source tree references at HEAD
+# (libpdx-argv, libpdx-cap, libpdx-semantic-pipe, libpdx-audit,
+# libpdx-elevate, libpdx-help) are consumed today as in-tree stubs,
+# not as installed shared libraries. Every consumer site in
+# src/*.pdx carries a header note naming the substrate gate that
+# blocks the real .so binding; the M2→M4 test suites drive against
+# those in-tree stubs via the seed helpers documented at
+# design/architecture.md §3.2.
+#
+# Consequence for pkg install cat at v1.0:
+# - No dependency closure to resolve — `pkg install cat` fetches
+#   only the cat package.
+# - The declared closure below is empty; no entry means no dep.
+#
+# Migration to a v1.1 dep set:
+# - When libpdx-argv M4 lands and cat migrates its argv parser from
+#   the in-tree byte scanner to libpdx-argv.parse_argv, an entry
+#   `libpdx-argv >= 1.0` lands here and manifest.pdxsig §3 rehashes
+#   this file.
+# - Same shape for libpdx-audit (blocked on r49-r50-plan.md §5.0
+#   R49-PREP-006), libpdx-semantic-pipe (blocked on shell.M2 pipeline
+#   mint + libpdx-semantic-pipe.M2), libpdx-elevate (unused by cat —
+#   cat requests no elevated caps).
+# - libpdx-cap arrives implicitly with shell.M2 exec-time cap
+#   validation; cat does not link libpdx-cap directly.
+#
+# The v1.0 shape below is deliberately terse — a single line comment
+# and no entries — to remain diffable across the migration.
+
+deps:
+  # (empty at v1.0 — see header note above)

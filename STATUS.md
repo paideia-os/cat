@@ -1,10 +1,10 @@
 # cat — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke matrix + pre-release
-fuzzers) — CLOSED. Ship-testable per the milestone rubric (§5 in
-`design/tooling/r49-r50-plan.md`). Ready for M5 (dual-signed
-release + `.pdxdoc` + mirror push).
+**Current milestone:** M5-001 (dual-signed release + `.pdxdoc`) —
+LANDED. M5-002 (mirror push) pending in this same M5 cycle. On M5
+close cat is *released* per the milestone rubric (§5 in
+`design/tooling/r49-r50-plan.md`).
 
 ## Milestone rollup
 
@@ -24,6 +24,8 @@ release + `.pdxdoc` + mirror push).
 | M4-002 (#12)    | schema-typed passthrough against known-schema fixture                   | LANDED |
 | M4-003 (#13)    | large-file streaming test (>RAM, no OOM)                                | LANDED |
 | M4-004 (#14)    | stdin-piping test (a | cat | b through shell pipeline)                  | LANDED |
+| M5-001 (#15)    | dual-signed manifest.pdxsig + CHANGELOG-1.0 + cat.pdxdoc + deps.list    | LANDED |
+| M5-002 (#16)    | pkgs.paideia-os staging mirror push manifest + v1.0.0 tag               | OPEN   |
 
 See `design/tooling/r49-r50-plan.md` §5.5 in paideia-os for the
 full milestone breakdown (M1–M5) and cross-repo dependencies.

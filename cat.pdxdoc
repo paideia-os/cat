@@ -1,0 +1,293 @@
+# cat — cat.pdxdoc
+#
+# Long-form documentation, `doc cat` back-end, invariant I7 §2 in
+# design/tooling/plan.md (paideia-os): "the man-equivalent. Longer
+# prose, cross-references, historical context ('this replaces POSIX
+# `<x>`; the differences are…')".
+#
+# This is the FIRST .pdxdoc file to ship in the R50 wave, and cat is
+# the first tool to reach M5, so the concrete shape below is the
+# working reference for the other R49/R50 tools' M5-001 issues (per
+# r49-r50-plan.md §5.5). The doc.M1-002 parser (issue in the doc
+# repo) reads THIS shape.
+#
+# Format sketch (subject to doc.M1-002 refinement — every field below
+# is text-line-oriented so the parser can be a byte-scanner without
+# an intermediate lexer):
+#
+#   .DOC <tool-name> <version>
+#   .META <key>: <value>            (one per line; RFC-2822 style)
+#   .END-META
+#   .SECTION <title>                (opens a section; § = "chapter")
+#     free prose lines
+#     .XREF <target>                (cross-ref to <tool>#section or url)
+#     .CODE                         (opens a code block)
+#       lines
+#     .END-CODE
+#     .POSIX-DIFF                   (opens a POSIX-difference callout)
+#       lines
+#     .END-POSIX-DIFF
+#   .END-SECTION
+#   .END-DOC
+#
+# The `doc` reader renders .SECTION headings with SGR bold, .CODE with
+# a monospace SGR, and .POSIX-DIFF with an inline callout (doc.M2-004
+# in r49-r50-plan.md §5.3). At M1 doc renders everything as plain
+# text (doc.M1-003). The semantic-pipe layer emits one PdxDocEntry
+# record per .SECTION (doc.M3-001).
+
+.DOC cat 1.0.0
+.META tool:         cat
+.META version:      1.0.0
+.META wave:         R50
+.META category:     A
+.META posix_ancestor: cat
+.META manifest:     manifest.pdxsig
+.META caps_decl:    caps.decl
+.META source_repo:  github.com/paideia-os/cat
+.META design_ref:   design/tooling/r49-r50-plan.md §5.5 (paideia-os)
+.META license:      MIT
+.END-META
+
+.SECTION Name
+`cat` — concatenate files and stream their bytes to stdout, with
+optional line-numbering, non-printable rendering, and a semantic-pipe
+layer that forwards typed records unchanged when the source file
+declares a schema.
+.END-SECTION
+
+.SECTION Synopsis
+.CODE
+cat [-n|-A|--schema] [<file>...]
+.END-CODE
+
+With one or more `<file>` arguments, `cat` reads each file in the
+order given and writes its bytes to the invoker's terminal (stdout,
+bound to KIND_TTY at exec). With zero positional arguments, `cat`
+reads its stdin instead (a KIND_IPC_ENDPOINT bound by the invoking
+shell's pipeline mint per shell.M2-002).
+.END-SECTION
+
+.SECTION Description
+`cat` is a byte pump with three concurrent output layers:
+
+1. Rendered text — file bytes go verbatim to KIND_TTY. With `-n`,
+   each output line is prefixed by its right-justified 6-column line
+   number followed by a tab. With `-A`, non-printable bytes render
+   as `^X` / `M-x` / `$` line-end markers matching the GNU
+   `cat -A = -vET` convention.
+2. Typed schema stream — if the source file's .pdxfs metadata
+   declares a schema (schema hash present in the file's cap
+   descriptor sidecar), `cat` streams that schema's records on the
+   semantic-pipe layer unchanged (schema-typed passthrough,
+   invariant D2 in design/tooling/plan.md; implemented at M3-001).
+   If no schema is declared, `cat` emits `RawByteChunk[]` records
+   (offset + bytes) at 64 KiB granularity (M3-002).
+3. Audit tail — every file read is journaled as a
+   `FileReadRecord` via libpdx-audit before the first byte crosses
+   into the sink (audit-first invariant D3; implemented at M3-003).
+
+Streaming is invariant: no file is ever fully buffered. The working
+set is bounded by a single 64 KiB chunk buffer regardless of file
+size (M2-003; regression test at M4-003).
+.END-SECTION
+
+.SECTION Flags
+`--help` / `--version` follow the standard I3 flag vocabulary in
+design/tooling/plan.md §4.2. The tool-specific flags are:
+
+.CODE
+  -n         Prefix each output line with a right-justified 6-column
+             line number followed by a tab. Numbering starts at 1
+             and is invocation-global (spans across multiple file
+             arguments).
+
+  -A         Render non-printable bytes as visible escapes:
+               control chars 0x00..0x1F, 0x7F  → ^X (X = c ^ 0x40)
+               high-bit chars 0x80..0xFF       → M-x
+               newline                         → $\n
+             Convenience alias equivalent to POSIX `cat -vET`.
+
+  --schema   Force schema-typed passthrough even when the input file
+             carries no schema hash. Useful for asserting a
+             downstream consumer's assumption that a pipeline
+             carries typed records. Refuses (exit 2) if the file
+             has no readable .pdxfs metadata.
+.END-SECTION
+
+.SECTION Capabilities
+The exec-time capability manifest is defined in `caps.decl`.
+
+.CODE
+requires:
+  - KIND_USER
+  - KIND_TTY(write)
+  - KIND_PDXFS_FILE(read, <arg-path>)     # one cap per file arg
+  - KIND_IPC_ENDPOINT
+.END-CODE
+
+Per-argument narrowing: `cat a b c` receives three distinct
+KIND_PDXFS_FILE(read) caps — one for each of a, b, c. No wildcard
+subtree is ever granted. The shell constructs these from the invoker's
+cap environment via libpdx-cap M2's cap_pack with narrow_rights.
+
+.XREF caps#per-argument-narrowing
+.XREF plan.md#I6-cap-manifest
+.END-SECTION
+
+.SECTION Exit codes
+`cat` follows invariant I4 (collapsed exit-code vocabulary) in
+design/tooling/plan.md §4.2:
+
+.CODE
+  0    every file read and rendered successfully
+  2    usage error   (missing file, unknown flag, name too long)
+  3    system error  (audit journal unreachable, sink overflow,
+                      file-read I/O error)
+  4    cap denied    (no read cap for a named file's path)
+.END-CODE
+
+Distinct codes at the assertion layer let a shell script (or a test
+harness) decode which failure class tripped without inspecting logs.
+.END-SECTION
+
+.SECTION Semantic pipe layout
+`cat` emits two record shapes on stdout's semantic-pipe layer,
+selected per file:
+
+.CODE
+  # Schema-typed passthrough (M3-001)
+  frame RecordFrame {
+      schema_hash: [u8; 32],     # from file's .pdxfs cap-desc sidecar
+      body_len:    u32,
+      body:        [u8; body_len],
+  }
+
+  # Schemaless RawByteChunk (M3-002)
+  schema RawByteChunk@0.1 {
+      offset: u64,               # byte offset in source file
+      bytes:  [u8],              # up to CHUNK_MAX = 65536 bytes
+  }
+.END-CODE
+
+The passthrough case is byte-exact: the wire frame body is the file
+body, no re-encoding, no schema translation. This is the D2 literal
+that makes `cat known-typed-file | downstream-consumer` work with
+zero schema-aware code in the downstream consumer beyond schema-hash
+recognition.
+
+.XREF plan.md#D2-composition-semantic-first
+.XREF libpdx-semantic-pipe.pdxdoc#passthrough
+.END-SECTION
+
+.SECTION Differences from POSIX cat
+
+.POSIX-DIFF
+POSIX cat has no notion of typed streams. GNU/BSD cat streams
+opaque bytes always. Paideia cat streams bytes AND, when the source
+file's .pdxfs metadata declares a schema, forwards typed records
+unchanged on the semantic-pipe layer. A downstream consumer that
+knows the schema reads records; one that does not reads bytes. Both
+work.
+.END-POSIX-DIFF
+
+.POSIX-DIFF
+POSIX cat has no capability manifest. Paideia cat receives EXACTLY
+the caps declared in caps.decl and no more; extra caps are refused
+by the shell at exec (libpdx-cap cap_manifest_verify). This means
+`cat /etc/shadow` on Paideia refuses with exit 4 if the invoking
+shell does not hold a KIND_PDXFS_FILE(read, /etc/shadow) cap to
+narrow forward — whereas POSIX cat refuses only on POSIX file-mode
+bits, which are advisory relative to the kernel.
+.END-POSIX-DIFF
+
+.POSIX-DIFF
+POSIX cat has no audit tail. Paideia cat journals a FileReadRecord
+via libpdx-audit before the first byte crosses into the sink. A
+downstream `journal-x` (audit explorer, plan.md §5 category E) can
+answer "who read this file, at what time, from what shell session,
+with what argv" without extra tooling.
+.END-POSIX-DIFF
+
+.POSIX-DIFF
+POSIX cat's -A flag (or -vET on strict POSIX) is spelled the same,
+same semantics. The -n flag is spelled the same, same semantics. The
+--schema flag is Paideia-native (no POSIX analog).
+.END-POSIX-DIFF
+
+.POSIX-DIFF
+POSIX cat's -u (unbuffered) flag has no analog. Paideia cat is
+always streaming — the 64 KiB chunk buffer at src/file_read.pdx is
+the ONLY working-set the tool ever holds. `-u` would be a no-op.
+.END-POSIX-DIFF
+
+.POSIX-DIFF
+POSIX cat's -b (number non-blank lines only) is not implemented at
+v1.0. The distinction is rarely worth the complexity — `cat -n` for
+all lines, or pipe through a `grep -n` for the non-blank subset.
+Filed as a candidate v1.1 addition if user demand appears.
+.END-POSIX-DIFF
+.END-SECTION
+
+.SECTION Examples
+.CODE
+# Single file to terminal:
+cat notes.md
+
+# Multi-file concatenation, order-preserving:
+cat header.pdx body.pdx footer.pdx
+
+# Line-numbered:
+cat -n build.log
+
+# Non-printable-visible (great for hex-tainted files):
+cat -A binary.dump
+
+# Schema-typed passthrough (source has a schema hash):
+cat data.records | table
+
+# Stdin passthrough through a shell pipeline (audit NOT fired):
+grep foo | cat | wc -l
+.END-CODE
+.END-SECTION
+
+.SECTION See also
+
+.XREF pkg.pdxdoc                    # install / verify signed packages
+.XREF shell.pdxdoc#pipeline         # how | mints IPC_ENDPOINT frames
+.XREF doc.pdxdoc                    # the .pdxdoc reader itself
+.XREF ls.pdxdoc                     # sibling coreutil, category A
+.XREF libpdx-audit.pdxdoc#FileReadRecord
+.XREF libpdx-semantic-pipe.pdxdoc#passthrough
+.XREF plan.md#I4-exit-codes         # in paideia-os design/tooling/
+.XREF r49-r50-plan.md#5.5           # cat's milestone breakdown
+.END-SECTION
+
+.SECTION History
+Landed as the second R50 tool to reach v1.0 (after pkg-bootstrap;
+pkg proper still en route via §5.1). Milestone rollup at STATUS.md;
+per-issue implementation notes at .plans/.
+
+M1 (2026-08-21) scaffolded the repo + argv surface + first-runnable
+KIND_TTY output. M2 landed multi-file streaming + `-n` / `-A` +
+stdin passthrough. M3 wired the semantic-pipe layer (schema-typed +
+schemaless) and the audit-first invariant. M4 landed four
+correctness tests covering argv-order preservation, schema
+passthrough, bounded-streaming for large files, and stdin piping.
+M5 (this release) ships the dual-signed manifest, the .pdxdoc file
+you are reading, and the mirror-push manifest to pkgs.paideia-os
+staging.
+
+Six of nine source modules — FileRead, StdinSource, TtySink,
+PipeOut, FileSchema, AuditStub — carry test-seedable stubs that
+stand in for kernel substrates not yet landed at HEAD
+(KIND_PDXFS_FILE from R42; shell.M2 pipeline mint;
+svc.audit-journal broker from R49-PREP-006). The stubs remain in
+place at v1.0 by design: the M4 correctness assertions are on
+observable I/O effects, not on which side of the stub boundary the
+byte crossed. When the real substrates wire in, the seed helpers
+retire, the .so bindings replace the stubs, and cat is rebuilt with
+no source changes on its dispatcher or argv or render layers.
+.END-SECTION
+
+.END-DOC
