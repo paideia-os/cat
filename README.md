@@ -4,17 +4,30 @@ paideia-os file read/concatenate (schema-passthrough on semantic pipes).
 
 ## Status
 
-M4 (correctness matrix + smoke fixtures) CLOSED — ship-testable
-per the milestone rubric. See `STATUS.md` for the per-issue
-rollup and `design/tooling/r49-r50-plan.md` §5.5 in the
+**Released — v1.0.0.** M5 (dual-signed release + `.pdxdoc` +
+mirror push) CLOSED. `cat` is released per the milestone rubric.
+See `STATUS.md` for the per-issue rollup, `CHANGELOG.md` for the
+v1.0.0 entry, `MIRROR.md` for the staging-push payload, and
+`design/tooling/r49-r50-plan.md` §5.5 in the
 [paideia-os](https://github.com/paideia-os/paideia-os) repo for
 the full milestone breakdown (M1–M5), KIND allocations, and
 cross-repo dependencies.
+
+Physical push to `pkgs.paideia-os` is deferred to T-INFRA-001 +
+T-INFRA-002 in the paideia-os meta repo (see `MIRROR.md` §1).
+`manifest.pdxsig` §6/§7 signature bytes are `PENDING` pending
+`paideia-as v0.33-crypto` (ML-DSA-65 primitive) + the signing bot
+host.
 
 ## Layout
 
 ```
 caps.decl                            # required capabilities (invariant I6)
+deps.list                            # shared-lib deps (empty at v1.0)
+manifest.pdxsig                      # dual-signed pkg manifest (§D4)
+cat.pdxdoc                           # long-form doc, `doc cat` back-end (I7 §2)
+CHANGELOG.md                         # release history
+MIRROR.md                            # pkgs.paideia-os staging push manifest
 design/architecture.md               # internal shape spec
 src/argv_dispatch.pdx                # CatDispatch: argv scan + top-level dispatcher
 src/file_read.pdx                    # FileRead: streaming open/read-chunk/close
