@@ -1,0 +1,341 @@
+// tests/m4_001_multi_file_order.pdx — cat.M4-001
+// CatM4001 module: multi-file order-preservation test.
+//
+// Purpose
+// -------
+// Prove that `cat_dispatch` streams N positional file arguments to
+// the sink in ARGV order — the first argv positional's bytes appear
+// first in `TtySink::tty_out_buf`, the second next, and so on. This
+// is the load-bearing correctness invariant of `cat`'s multi-file
+// mode (M2-001 in `design/tooling/r49-r50-plan.md` §5.5).
+//
+// Fixture shape
+// -------------
+//   argv = [ "cat"\0 , "file_a"\0 , "file_b"\0 , "file_c"\0 ]  argc = 4
+//   FileRead seeds (FIFO):
+//     seed 1: "AAA\n"       (4 bytes, handle 1)
+//     seed 2: "BBB\n"       (4 bytes, handle 2)
+//     seed 3: "CCC\n"       (4 bytes, handle 3)
+//
+// Because the M2 `FileRead` stub ignores the argv path bytes and
+// draws from the seed table in FIFO order, `cat_dispatch`'s per-
+// file loop MUST pair positional[i] with seed[i+1] (1-based) for
+// the sink content to appear as "AAA\nBBB\nCCC\n". Any argv-order
+// bug — visiting positionals out of order, or advancing the file
+// handle before completing the previous file — leaves the sink
+// permutation ≠ the expected 12-byte sequence and the test fails.
+//
+// Assertions (in order; first miss returns a distinct exit code)
+// --------------------------------------------------------------
+//   1. cat_dispatch(&argv, 4) returns CAT_EXIT_OK (0).
+//   2. TtySink::tty_out_len == 12.
+//   3. AuditStub::_audit_file_count == 3 (one FileReadRecord per
+//      argv positional, per the M3-003 audit-first invariant).
+//   4. TtySink::tty_out_buf[0..12] byte-equals "AAA\nBBB\nCCC\n".
+//
+// Return codes from `test_cat_m4_001_multi_file_order`
+// ----------------------------------------------------
+//   0  — PASS
+//   1  — cat_dispatch returned non-zero exit code
+//   2  — tty_out_len != 12
+//   3  — audit count != 3
+//   4  — sink byte-sequence mismatch (order violation)
+//
+// paideia-as compliance
+// ---------------------
+//   - Module basename `CatM4001` (PascalCase), no directory prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     12 for the sink-length check).
+//   - r11 scratch (paideia-as reserved); reloaded before every
+//     `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - Byte writes to `.bss` fixtures use the `add`-adjust pattern
+//     (`lea r11, [rip + buf]; add r11, N; mov_b [r11], rax`)
+//     matching TtySink::tty_write_bytes' idiom — no `[base+reg]`
+//     byte-scale addressing.
+//   - `test_cat_m4_001_multi_file_order` is non-leaf: 5-push
+//     callee-save prologue (rbx / r12 / r13 / r14 / r15) lands
+//     rsp%16 == 0 at every nested call site.
+//   - `.bss` slot names prefixed `m4_001_` to sidestep cross-repo
+//     unqualified-name collisions (matches the R48 vello↔vrr
+//     `vrc_→vrenc_` rename policy in paideia-os).
+
+module CatM4001 = structure {
+
+  // ============================================================================
+  // Fixture .bss — populated at test entry (paideia-as has no data
+  // literals; every byte is written at runtime).
+  // ============================================================================
+
+  // Per-file source buffers (populated in test_main).
+  //   "AAA\n" = { 0x41, 0x41, 0x41, 0x0A }
+  //   "BBB\n" = { 0x42, 0x42, 0x42, 0x0A }
+  //   "CCC\n" = { 0x43, 0x43, 0x43, 0x0A }
+  pub let mut m4_001_src_a : [u8; 8] = uninit @align(8)
+  pub let mut m4_001_src_b : [u8; 8] = uninit @align(8)
+  pub let mut m4_001_src_c : [u8; 8] = uninit @align(8)
+
+  // Path strings (M2 stub ignores content; must be NUL-terminated
+  // and non-empty so cat_parse_argv accepts them as positionals).
+  //   "file_a\0" (7 bytes), "file_b\0", "file_c\0"
+  pub let mut m4_001_path_a : [u8; 8] = uninit @align(8)
+  pub let mut m4_001_path_b : [u8; 8] = uninit @align(8)
+  pub let mut m4_001_path_c : [u8; 8] = uninit @align(8)
+
+  // argv[0] = "cat\0".
+  pub let mut m4_001_argv0 : [u8; 8] = uninit @align(8)
+
+  // argv array of 4 u64 pointers.
+  pub let mut m4_001_argv : [u64; 4] = uninit @align(8)
+
+  // Expected sink bytes, populated at test entry:
+  //   "AAA\nBBB\nCCC\n" = { 0x41, 0x41, 0x41, 0x0A,
+  //                         0x42, 0x42, 0x42, 0x0A,
+  //                         0x43, 0x43, 0x43, 0x0A }
+  pub let mut m4_001_expected : [u8; 16] = uninit @align(8)
+
+  // ============================================================================
+  // test_cat_m4_001_multi_file_order() -> u64
+  //
+  // Signature: test_cat_m4_001_multi_file_order : () -> u64 !{mem} @{}
+  //   RAX: 0 on PASS, distinct non-zero per assertion failure (see
+  //        header for the codebook).
+  //
+  // Non-leaf; 5-push callee-save prologue for 16-byte alignment.
+  // ============================================================================
+  pub let test_cat_m4_001_multi_file_order : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M4-001 multi-file order-preservation test. Populates three seed buffers (A/B/C, 4 bytes each with '\\n' terminator) and three dummy path buffers via byte-store immediates (paideia-as has no data literals — every fixture byte is written at test entry). Populates argv[4] with lea-computed pointers. Resets FileRead/StdinSource/AuditStub/FileSchema seed tables (dispatch does not — it resets only CatDispatch, TtySink, Render per file header at src/argv_dispatch.pdx). Pushes three seeds FIFO. Calls cat_dispatch(argv, 4). Asserts: (1) exit == 0; (2) tty_out_len == 12; (3) audit_stub_get_count == 3; (4) sink bytes 0..12 byte-equal to expected sequence 'AAA\\nBBB\\nCCC\\n' via a scan loop that byte-loads sink + expected side-by-side with `lea r11,[base+rcx*1]; xor rax,rax; mov_b rax,[r11]` (#1248) — order violation surfaces as a byte mismatch at the first divergent index. Distinct non-zero exit codes per failure (1/2/3/4) so a driver harness can decode. 5-push callee-save prologue (rbx=sink_base / r12=expected_base / r13=scan_cursor / r14=expected_byte / r15=pad) lands rsp%16 == 0 at every nested call site. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max: 12 for the sink-length check).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ==============================================================
+        // Populate source buffers (write bytes into .bss fixtures).
+        // ==============================================================
+
+        // m4_001_src_a = "AAA\n"
+        lea r11, [rip + m4_001_src_a];
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_a]; add r11, 1;
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_a]; add r11, 2;
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_a]; add r11, 3;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // m4_001_src_b = "BBB\n"
+        lea r11, [rip + m4_001_src_b];
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_b]; add r11, 1;
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_b]; add r11, 2;
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_b]; add r11, 3;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // m4_001_src_c = "CCC\n"
+        lea r11, [rip + m4_001_src_c];
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_c]; add r11, 1;
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_c]; add r11, 2;
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_src_c]; add r11, 3;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate expected sink bytes = "AAA\nBBB\nCCC\n" (12 bytes).
+        // Slot 12..15 are unused padding.
+        // ==============================================================
+        lea r11, [rip + m4_001_expected];
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 1;
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 2;
+        mov rax, 0x41; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 3;
+        mov rax, 0x0A; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 4;
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 5;
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 6;
+        mov rax, 0x42; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 7;
+        mov rax, 0x0A; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 8;
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 9;
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 10;
+        mov rax, 0x43; mov_b [r11], rax;
+        lea r11, [rip + m4_001_expected]; add r11, 11;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv[0] = "cat\0" and the three path fixtures.
+        // Path content is ignored by the M2 FileRead stub (which
+        // draws handles FIFO from the seed table); the paths need
+        // only be non-empty NUL-terminated strings so cat_parse_argv
+        // accepts them as positionals.
+        // ==============================================================
+
+        // argv[0] = "cat\0"
+        lea r11, [rip + m4_001_argv0];
+        mov rax, 0x63; mov_b [r11], rax;         // 'c'
+        lea r11, [rip + m4_001_argv0]; add r11, 1;
+        mov rax, 0x61; mov_b [r11], rax;         // 'a'
+        lea r11, [rip + m4_001_argv0]; add r11, 2;
+        mov rax, 0x74; mov_b [r11], rax;         // 't'
+        lea r11, [rip + m4_001_argv0]; add r11, 3;
+        xor rax, rax; mov_b [r11], rax;          // '\0'
+
+        // m4_001_path_a = "a\0" (single non-'-' byte is enough to
+        // route cat_parse_argv into the positional branch; NUL
+        // terminates within NAME_MAX_LEN = 236).
+        lea r11, [rip + m4_001_path_a];
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_001_path_a]; add r11, 1;
+        xor rax, rax; mov_b [r11], rax;
+
+        // m4_001_path_b = "b\0"
+        lea r11, [rip + m4_001_path_b];
+        mov rax, 0x62; mov_b [r11], rax;
+        lea r11, [rip + m4_001_path_b]; add r11, 1;
+        xor rax, rax; mov_b [r11], rax;
+
+        // m4_001_path_c = "c\0"
+        lea r11, [rip + m4_001_path_c];
+        mov rax, 0x63; mov_b [r11], rax;
+        lea r11, [rip + m4_001_path_c]; add r11, 1;
+        xor rax, rax; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv[4] = { &argv0, &path_a, &path_b, &path_c }.
+        // ==============================================================
+        lea r11, [rip + m4_001_argv];
+        lea rax, [rip + m4_001_argv0];
+        mov [r11 + 0*8], rax;
+        lea r11, [rip + m4_001_argv];
+        lea rax, [rip + m4_001_path_a];
+        mov [r11 + 1*8], rax;
+        lea r11, [rip + m4_001_argv];
+        lea rax, [rip + m4_001_path_b];
+        mov [r11 + 2*8], rax;
+        lea r11, [rip + m4_001_argv];
+        lea rax, [rip + m4_001_path_c];
+        mov [r11 + 3*8], rax;
+
+        // ==============================================================
+        // Reset stub state (cat_dispatch does not reset these —
+        // harness pattern documented at src/argv_dispatch.pdx file
+        // header).
+        // ==============================================================
+        call file_read_reset;
+        call stdin_reset;
+        call audit_stub_reset;
+        call file_schema_reset;
+
+        // ==============================================================
+        // Push seeds FIFO. Handle 1 → src_a; handle 2 → src_b;
+        // handle 3 → src_c.
+        // ==============================================================
+        lea rdi, [rip + m4_001_src_a];
+        mov rsi, 4;
+        call file_read_seed_push;
+        lea rdi, [rip + m4_001_src_b];
+        mov rsi, 4;
+        call file_read_seed_push;
+        lea rdi, [rip + m4_001_src_c];
+        mov rsi, 4;
+        call file_read_seed_push;
+
+        // ==============================================================
+        // Dispatch.
+        // ==============================================================
+        lea rdi, [rip + m4_001_argv];
+        mov rsi, 4;
+        call cat_dispatch;
+        cmp rax, 0;
+        jne m4_001_fail_exit;
+
+        // ==============================================================
+        // Assertion 2: TtySink::tty_out_len == 12.
+        // ==============================================================
+        lea r11, [rip + tty_out_len];
+        mov rax, [r11];
+        cmp rax, 12;
+        jne m4_001_fail_len;
+
+        // ==============================================================
+        // Assertion 3: AuditStub::_audit_file_count == 3.
+        // ==============================================================
+        call audit_stub_get_count;
+        cmp rax, 3;
+        jne m4_001_fail_audit;
+
+        // ==============================================================
+        // Assertion 4: byte-by-byte scan of tty_out_buf[0..12] vs
+        // m4_001_expected[0..12].
+        // ==============================================================
+        lea rbx, [rip + tty_out_buf];         // rbx = sink base
+        lea r12, [rip + m4_001_expected];     // r12 = expected base
+        xor r13, r13;                         // r13 = scan cursor i
+
+      m4_001_scan_head:
+        cmp r13, 12;
+        jge m4_001_pass;
+
+        // Load sink byte.
+        lea r11, [rbx + r13*1];
+        xor rax, rax;
+        mov_b rax, [r11];
+
+        // Load expected byte.
+        lea r11, [r12 + r13*1];
+        xor r14, r14;
+        mov_b r14, [r11];
+
+        cmp rax, r14;
+        jne m4_001_fail_bytes;
+
+        add r13, 1;
+        jmp m4_001_scan_head;
+
+      m4_001_pass:
+        xor rax, rax;                         // PASS = 0
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      m4_001_fail_exit:
+        mov rax, 1;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_001_fail_len:
+        mov rax, 2;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_001_fail_audit:
+        mov rax, 3;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_001_fail_bytes:
+        mov rax, 4;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+      }
+    }
+}
