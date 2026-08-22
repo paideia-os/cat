@@ -1,10 +1,44 @@
 // src/argv_dispatch.pdx — cat.M1-001..M1-003 (skeleton) → cat.M2-001..M2-004
+// → cat.M3-001..M3-003
 // CatDispatch module: argv → parsed flags + positional list → per-
-// file streaming read → render (-n / -A) → TtySink; OR stdin read
-// → render → TtySink when argv has zero positionals.
+// file streaming read → (render-text OR semantic-pipe) → TtySink;
+// OR stdin read → render → TtySink when argv has zero positionals.
 //
-// M2 pipeline (replaces the M1 single-file / stubbed-read shape)
-// --------------------------------------------------------------
+// M3 pipeline (extends M2 with audit-first + semantic-pipe layer)
+// ---------------------------------------------------------------
+// Per-invocation prelude (steps 1–4 unchanged from M2). Per-file
+// loop (step 5 file-path branch) gains two new stages:
+//
+//   5a. audit_stub_file_read(pos_ptrs[i]) — M3-003. Journals a
+//       FileReadRecord to /system/audit/user-events/ BEFORE the
+//       first byte of this file reaches the sink. On broker
+//       unreachable → CAT_EXIT_SYSTEM_ERROR (3). This is the D3
+//       audit-first gate: a tool that cannot journal its output
+//       must not emit output.
+//
+//   5b. Branch on FLAG_SCHEMA (bit 2 of flag_mask):
+//         - FLAG_SCHEMA clear → M2 render path unchanged:
+//           chunked file_read_chunk → render_write_bytes →
+//           tty_write_byte(s).
+//         - FLAG_SCHEMA set → file_schema_query(handle):
+//             - hash_ptr != 0 → M3-001 schema-typed passthrough:
+//               chunked file_read_chunk →
+//               pipe_forward_write(hash_ptr, fr_chunk_buf, bytes).
+//               The per-chunk write fans out into ≤ 4056-byte
+//               framed records on the semantic-pipe wire.
+//             - hash_ptr == 0 → M3-002 RawByteChunk emission:
+//               rbc_reset (zeros per-file offset + installs hash),
+//               chunked file_read_chunk → rbc_emit_chunk which
+//               composes [offset:u64 | bytes] records ≤ 4048 body
+//               bytes each and calls pipe_forward_frame per
+//               record.
+//
+// Stdin path (pos_count == 0) is unchanged from M2 — no per-file
+// audit (there is no file) and no schema branch (stdin carries
+// no `.pdxfs` metadata).
+//
+// M2 pipeline (baseline, unchanged where not overridden by M3)
+// ------------------------------------------------------------
 //   1. `cat_reset` — zero parser state.
 //   2. `cat_parse_argv` — populate `flag_mask`, `pos_ptrs`,
 //      `pos_count`. Parse error collapses to CAT_EXIT_USAGE_ERROR.
@@ -18,13 +52,11 @@
 //          `stdin_read_chunk(fr_chunk_buf, CHUNK_MAX)` →
 //          `render_write_bytes(fr_chunk_buf, bytes)` until EOF
 //          (0-byte read).
-//        - pos_count > 0 → multi-file path (M2-001): for each
-//          `pos_ptrs[i]` in argv-order, `file_open` (0 → exit 4),
-//          then loop `file_read_chunk(handle, fr_chunk_buf,
-//          CHUNK_MAX)` → `render_write_bytes(fr_chunk_buf,
-//          bytes)` until EOF, then `file_close(handle)`.
+//        - pos_count > 0 → multi-file path (M2-001, extended by
+//          M3 as above).
 //   6. Return CAT_EXIT_OK / CAT_EXIT_SYSTEM_ERROR (any sink
-//      overflow) / CAT_EXIT_CAP_DENIED (any file_open miss).
+//      overflow, audit unreachable) / CAT_EXIT_CAP_DENIED (any
+//      file_open miss).
 //
 // Streaming discipline (M2-003)
 // -----------------------------
@@ -38,12 +70,17 @@
 // Test seedability (M4 sets up state before dispatch)
 // ---------------------------------------------------
 // `cat_dispatch` does NOT call `file_read_reset` / `stdin_reset`
-// itself — those clear the M2 seed table which the M4 test harness
-// populates BEFORE dispatch (via `file_read_seed_push` and
-// `stdin_seed`). This lets a test seed once, dispatch, and inspect
-// `TtySink::tty_out_buf`. Real R42 replaces the seed table with
-// `sys_pdxfs_open` / `sys_ipc_recv` and the M2 seed helpers are
-// deleted; `cat_dispatch`'s own control flow does not change.
+// / `audit_stub_reset` / `file_schema_reset` itself — those clear
+// the M2/M3 seed tables which the M4 test harness populates
+// BEFORE dispatch (via `file_read_seed_push`, `stdin_seed`,
+// `audit_stub_seed_broker_failure`, `file_schema_seed`). This
+// lets a test seed once, dispatch, and inspect
+// `TtySink::tty_out_buf` plus `audit_stub_get_count` +
+// `rbc_get_offset`. Real R42 / libpdx-audit / libpdx-semantic-
+// pipe wiring replaces the seed tables with `sys_pdxfs_open`,
+// `sys_ipc_send` (audit journal), and `Passthrough::pipe_forward`;
+// the M3 stub helpers are deleted at that point and
+// `cat_dispatch`'s own control flow does not change.
 //
 // Exit-code discipline (per I4 in design/tooling/plan.md §4.2):
 //   0 — every file read and rendered successfully
@@ -332,7 +369,7 @@ module CatDispatch = structure {
   pub let cat_dispatch : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M2-001+M2-002+M2-003+M2-004 cat_dispatch. Sequences cat_reset → cat_parse_argv → tty_reset → render_reset(flag_mask) → branch on pos_count → per-file streaming (or stdin streaming). Streaming loop uses FileRead::fr_chunk_buf (64 KiB .bss) as staging area — file_read_chunk / stdin_read_chunk cap per-call bytes at CHUNK_MAX = 65536, and cat_dispatch loops until EOF (0-byte read). Every nested call return checked: parse failure → CAT_EXIT_USAGE_ERROR (2); render_write_bytes non-zero → CAT_EXIT_SYSTEM_ERROR (3); file_open == 0 → CAT_EXIT_CAP_DENIED (4). file_close return ignored (M2 no-op; R42 close-fail becomes CAT_EXIT_SYSTEM_ERROR — a body-only edit at that time). 5-push callee-save prologue (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every nested call site. r12/r13 hold argv/argc during parse then get reused (r13 = pos_count snapshot after parse); rbx holds the current file handle across the inner streaming loop; r14 is the file-loop index. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest for CHUNK_MAX). cat_dispatch does NOT reset the FileRead / StdinSource seed tables — those are M2-stub-only test state that the M4 harness sets up BEFORE calling cat_dispatch (see file header for the R42-substrate note that removes seed tables entirely).",
+      justification: "cat.M2-001..M2-004 + cat.M3-001..M3-003 cat_dispatch. Sequences cat_reset → cat_parse_argv → tty_reset → render_reset(flag_mask) → branch on pos_count → per-file streaming (or stdin streaming). Per-file loop gains two M3 stages: (5a) audit_stub_file_read(pos_ptrs[i]) before first byte — journals a FileReadRecord; broker unreachable → CAT_EXIT_SYSTEM_ERROR (3); (5b) FLAG_SCHEMA branch — clear routes to the M2 render_write_bytes path unchanged; set routes to file_schema_query(handle) which returns hash_ptr (0 = schemaless): non-zero hash → pipe_forward_write(hash, chunk, bytes) per chunk (M3-001 schema-typed passthrough via semantic-pipe framed records); zero hash → rbc_reset then rbc_emit_chunk(chunk, bytes) per chunk (M3-002 RawByteChunk emission, per-file offset advanced internally). Streaming loop uses FileRead::fr_chunk_buf (64 KiB .bss) as staging area — file_read_chunk / stdin_read_chunk cap per-call bytes at CHUNK_MAX = 65536, and cat_dispatch loops until EOF (0-byte read). Every nested call return checked: parse failure → CAT_EXIT_USAGE_ERROR (2); render_write_bytes / pipe_forward_write / rbc_emit_chunk non-zero → CAT_EXIT_SYSTEM_ERROR (3); audit_stub_file_read non-zero → CAT_EXIT_SYSTEM_ERROR (3); file_open == 0 → CAT_EXIT_CAP_DENIED (4). file_close return ignored (M2 no-op; R42 close-fail becomes CAT_EXIT_SYSTEM_ERROR — a body-only edit at that time). 5-push callee-save prologue (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every nested call site. Register plan: rbx = current file handle; r12 = M3 schema hash ptr for current file (0 = RBC path); r13 = pos_count snapshot (after parse); r14 = file-loop index i; r15 = alignment pad. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest for CHUNK_MAX). cat_dispatch does NOT reset FileRead / StdinSource / AuditStub / FileSchema seed tables — those are stub-only test state the M4 harness sets up BEFORE calling cat_dispatch (see file header for the R42/libpdx wiring note that removes seed tables entirely). RawByteChunk::rbc_reset IS called per-file inside the RBC-path arm because it zeroes the per-file byte offset (starts at 0 for each file per M3-002 spec).",
       block: {
         // ---- prologue: 5 pushes for 16-byte alignment -----------------
         push rbx;
@@ -373,7 +410,9 @@ module CatDispatch = structure {
         jmp cd_file_path;
 
         // ==============================================================
-        //   File path (M2-001 multi-file + M2-003 streaming)
+        //   File path (M2-001 multi-file + M2-003 streaming +
+        //   M3-001 schema-typed passthrough + M3-002 RawByteChunk +
+        //   M3-003 per-file FileReadRecord audit)
         // ==============================================================
       cd_file_path:
         xor r14, r14;                   // i = 0
@@ -382,7 +421,7 @@ module CatDispatch = structure {
         cmp r14, r13;
         jge cd_ok;
 
-        // file_open(pos_ptrs[r14])
+        // ---- file_open(pos_ptrs[r14]) --------------------------------
         lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + r14*8];
         call file_open;
@@ -390,6 +429,69 @@ module CatDispatch = structure {
         je cd_cap_denied;
         mov rbx, rax;                   // rbx = handle
 
+        // ---- M3-003: audit_stub_file_read(pos_ptrs[r14]) --------------
+        // MUST land before any byte of this file's output reaches the
+        // sink. On broker unreachable → CAT_EXIT_SYSTEM_ERROR (3) per
+        // D3 audit-first (see plan §3).
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + r14*8];
+        call audit_stub_file_read;
+        cmp rax, 0;
+        jne cd_system_error;
+
+        // ---- Branch on FLAG_SCHEMA (bit 2 of flag_mask) --------------
+        lea r11, [rip + flag_mask];
+        mov rax, [r11];
+        and rax, 0x4;                   // FLAG_SCHEMA
+        cmp rax, 0;
+        je cd_file_render_path;
+
+        // ---- M3 schema path: query per-file schema hash --------------
+        mov rdi, rbx;
+        call file_schema_query;
+        mov r12, rax;                   // r12 = hash_ptr (0 = schemaless)
+
+        // If schemaless (r12 == 0), reset RBC per-file offset before
+        // the inner loop; if schema-declared, no reset needed.
+        cmp r12, 0;
+        jne cd_schema_inner_head;
+        call rbc_reset;
+
+      cd_schema_inner_head:
+        // file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
+        mov rdi, rbx;
+        lea rsi, [rip + fr_chunk_buf];
+        mov rdx, 65536;                 // CHUNK_MAX
+        call file_read_chunk;
+        cmp rax, 0;
+        je cd_file_close;               // 0 bytes = EOF this file
+
+        // Dispatch on schema-ness (r12 preserved across the read).
+        cmp r12, 0;
+        je cd_schema_rbc_call;
+
+        // ---- M3-001: pipe_forward_write(hash_ptr, chunk, bytes) ------
+        mov rdx, rax;                   // bytes read (arg3: total_len)
+        mov rdi, r12;                   // hash_ptr
+        lea rsi, [rip + fr_chunk_buf];  // src
+        call pipe_forward_write;
+        cmp rax, 0;
+        jne cd_system_error;
+        jmp cd_schema_inner_head;
+
+      cd_schema_rbc_call:
+        // ---- M3-002: rbc_emit_chunk(chunk, bytes) --------------------
+        mov rsi, rax;                   // bytes read (arg2: len)
+        lea rdi, [rip + fr_chunk_buf];  // src
+        call rbc_emit_chunk;
+        cmp rax, 0;
+        jne cd_system_error;
+        jmp cd_schema_inner_head;
+
+        // ==============================================================
+        //   M2 render-text path (FLAG_SCHEMA clear)
+        // ==============================================================
+      cd_file_render_path:
       cd_file_inner_head:
         // file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
         mov rdi, rbx;                   // handle
@@ -397,7 +499,7 @@ module CatDispatch = structure {
         mov rdx, 65536;                 // CHUNK_MAX
         call file_read_chunk;
         cmp rax, 0;
-        je cd_file_inner_done;          // 0 bytes = EOF
+        je cd_file_close;               // 0 bytes = EOF
 
         // render_write_bytes(fr_chunk_buf, bytes)
         lea rdi, [rip + fr_chunk_buf];
@@ -407,7 +509,7 @@ module CatDispatch = structure {
         jne cd_system_error;
         jmp cd_file_inner_head;
 
-      cd_file_inner_done:
+      cd_file_close:
         // file_close(handle) — M2 no-op; return ignored.
         mov rdi, rbx;
         call file_close;

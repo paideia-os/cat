@@ -44,7 +44,8 @@ surface is:
     sink overflow, file-read I/O error at R42+).
   - 4 — cap denied (no read cap for a named file's path).
 
-Internally the binary is five modules at M2:
+Internally the binary is five modules at M2, extended to nine at
+M3:
 
 - `CatDispatch` (`src/argv_dispatch.pdx`) — argv parsing at M2
   (inline byte-scan; M3 migrates to `libpdx-argv` now that
@@ -98,6 +99,48 @@ The alt entry `cat_dispatch_from_buf(buf, buf_len)` bypasses
 argv + file read + render — driving `TtySink::tty_write_bytes`
 directly. It remains the simplest end-to-end fixture, useful for
 smoke-checking the M2 sink cap.
+
+**M3 adds four modules to the binary:**
+
+- `PipeOut` (`src/pipe_out.pdx`) — semantic-pipe frame emitter
+  standing in for `libpdx-semantic-pipe`.
+  `pipe_forward_frame(hash_ptr, body_ptr, body_len)` emits ONE
+  R20b IPC frame with a 32-byte schema-hash prefix (op / ver /
+  flags LE u16 / payload_len LE u32 = 32 + body_len; then hash
+  bytes; then body bytes) through TtySink so the wire layout is
+  observable to the M4 harness. `pipe_forward_write(hash_ptr,
+  src_ptr, total_len)` sub-chunks src into ≤ SP_MAX_RECORD_BODY
+  (4056) byte frames and emits one `pipe_forward_frame` per
+  sub-chunk. When libpdx-semantic-pipe wires in (a shell.M2 +
+  libpdx-semantic-pipe.M2 dependency chain), the frame emit path
+  flips to `Send::send_frame` / `Passthrough::pipe_forward`; the
+  two function signatures are invariant.
+- `FileSchema` (`src/file_schema.pdx`) — per-handle
+  schema-hash lookup stub. `file_schema_query(handle)` returns
+  the 32-byte schema-hash pointer for a schema-declared file, or
+  0 for schemaless. The M4 test harness pre-seeds the per-handle
+  table via `file_schema_seed(handle, hash_ptr)`. R42's real
+  `sys_pdxfs_getxattr(handle, "pdxfs.schema", ...)` replaces the
+  stub body; the query signature is invariant.
+- `RawByteChunk` (`src/raw_byte_chunk.pdx`) — schemaless-file
+  fallback for the `--schema` path. Owns
+  `_rbc_schema_hash : [u64; 4]` (RawByteChunk@0.1 placeholder
+  fingerprint), `_rbc_file_offset : u64` (per-file byte offset,
+  reset per file via `rbc_reset`), and
+  `_rbc_scratch : [u8; 4056]` (record staging).
+  `rbc_emit_chunk(src, len)` sub-chunks src into ≤ RBC_MAX_BODY
+  (4048) byte records, each of the form
+  `[offset:u64 LE | bytes]`, and emits one
+  `PipeOut::pipe_forward_frame` per sub-chunk.
+- `AuditStub` (`src/audit_stub.pdx`) — D3 audit-first gate stub
+  for `libpdx-audit`. `audit_stub_file_read(path_ptr)` is an
+  atomic begin+commit for one per-file FileReadRecord; the caller
+  (`cat_dispatch`) checks the return before emitting any byte of
+  that file's output. Broker unreachable → exit 3. The real
+  libpdx-audit three-call sequence (`audit_begin` +
+  `audit_record_output` + `audit_commit`) replaces the stub body
+  when the `svc.audit-journal` broker binding lands; the
+  `cat_dispatch` call site is invariant.
 
 ---
 
@@ -208,6 +251,56 @@ Real R42 replaces the seed tables with `sys_pdxfs_open` /
 `sys_ipc_recv` and deletes the M2 seed helpers; `cat_dispatch`'s
 own control flow is invariant across the migration.
 
+### 3.3 M3 pipeline extensions
+
+Step 5 (the per-file loop) grows two new stages that land between
+`file_open` and the M2 inner read loop:
+
+```
+for i in 0..pos_count:
+  handle = file_open(pos_ptrs[i])
+  if handle == 0: return exit 4                             # cap denied
+
+  # ---- 5a: M3-003 audit-first gate ------------------------
+  if audit_stub_file_read(pos_ptrs[i]) != 0:                # broker unreachable
+    return exit 3                                           # D3: refuse to emit
+
+  # ---- 5b: M3 schema branch -------------------------------
+  if flag_mask & FLAG_SCHEMA:
+    hash_ptr = file_schema_query(handle)
+    if hash_ptr == 0:
+      rbc_reset()                                            # per-file offset = 0
+    loop:
+      bytes = file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
+      if bytes == 0: break                                   # EOF this file
+      if hash_ptr != 0:                                      # M3-001 passthrough
+        if pipe_forward_write(hash_ptr, fr_chunk_buf, bytes) != 0:
+          return exit 3
+      else:                                                  # M3-002 RawByteChunk
+        if rbc_emit_chunk(fr_chunk_buf, bytes) != 0:
+          return exit 3
+  else:                                                      # M2 render path
+    loop:
+      bytes = file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
+      if bytes == 0: break
+      if render_write_bytes(fr_chunk_buf, bytes) != 0:
+        return exit 3
+
+  file_close(handle)
+```
+
+The audit call MUST land before any byte of the file's output
+reaches TtySink — for the render path this is before the first
+`render_write_bytes` call, and for both schema paths this is
+before the first `pipe_forward_frame` (which is where any wire
+byte ultimately hits the sink). The stdin path has no audit call
+(no file to record); a future stdin/IPC-receive record is a
+shell.M3 concern.
+
+`rbc_reset` is called INSIDE the per-file loop on the schemaless
+path so `_rbc_file_offset` re-zeros between files — each file's
+first RawByteChunk record starts at offset 0.
+
 ---
 
 ## 4. Storage model
@@ -242,10 +335,31 @@ All M2 state is `.bss`-singleton (one dispatch per process). The
 - `TtySink.tty_out_len : u64` — sink cursor / bytes-written
   running count.
 
+M3 adds the following `.bss` slots (all with module-scoped
+prefixes to sidestep cross-repo unqualified-symbol collisions):
+
+- `FileSchema._fs_hash_ptrs : [u64; 9]` — per-handle schema-hash
+  pointers. Slot 0 unused (invalid-handle sentinel); slots 1..8
+  hold caller-supplied hash pointers or 0.
+- `RawByteChunk._rbc_schema_hash : [u64; 4]` — 32-byte
+  RawByteChunk@0.1 placeholder fingerprint installed by
+  `rbc_reset`.
+- `RawByteChunk._rbc_file_offset : u64` — per-file byte offset;
+  advanced by `rbc_emit_chunk`, reset per file by `rbc_reset`.
+- `RawByteChunk._rbc_scratch : [u8; 4056]` — record staging
+  buffer holding [8B offset | up-to-4048B bytes].
+- `AuditStub._audit_broker_failed : u64` — sticky broker-failure
+  flag.
+- `AuditStub._audit_file_count : u64` — monotonic count of
+  successful per-file audit records (M4 observability).
+- `AuditStub._audit_last_path_ptr : u64` — most recent per-file
+  audit's path pointer (bookkeeping).
+
 `.bss` slot names in modules other than TtySink and CatDispatch
-carry a module-scoped prefix (`fr_`, `sr_`, `render_`) to avoid
-cross-repo unqualified-symbol collisions (mirrors the R48 vello↔
-vrr `vrc_→vrenc_` rename policy in paideia-os).
+carry a module-scoped prefix (`fr_`, `sr_`, `render_`, `_fs_`,
+`_rbc_`, `_audit_`) to avoid cross-repo unqualified-symbol
+collisions (mirrors the R48 vello↔vrr `vrc_→vrenc_` rename policy
+in paideia-os).
 
 M4 migrates these to caller-owned structures once the call-graph
 is stable.
@@ -300,25 +414,51 @@ Every source file in this tree observes:
 - **libpdx-argv (paideia-os/libpdx-argv):** libpdx-argv M2-001
   landed the FKIND_UNKNOWN=boolean fix that unblocks cat's
   migration. Migration scheduled at cat.M3.
-- **libpdx-semantic-pipe:** cat.M3-001 depends on
-  libpdx-semantic-pipe.M2 (schema-typed passthrough via
-  `Passthrough::pipe_forward`).
-- **libpdx-audit:** cat.M3-003 depends on libpdx-audit.M2
-  (FileReadRecord per file before first byte).
+- **libpdx-semantic-pipe:** cat.M3-001 ships a `PipeOut` stub
+  whose wire format mirrors what `Passthrough::pipe_forward` /
+  `Send::send_frame` will emit; the real library binding lands
+  once libpdx-semantic-pipe.M2 + a downstream KIND_IPC_ENDPOINT
+  are in place (shell.M2 concern). The two `pipe_forward_*`
+  signatures are invariant across the migration.
+- **libpdx-audit:** cat.M3-003 ships an `AuditStub` whose
+  `audit_stub_file_read(path_ptr)` shape mirrors the real
+  three-call sequence (`audit_begin` + `audit_record_output` +
+  `audit_commit`). The `svc.audit-journal` broker binding lands
+  once shell.M2 mints the endpoint cap; `cat_dispatch`'s per-file
+  audit call site is invariant across the migration.
 
 ---
 
-## 7. M2 non-goals
+## 7. M3 non-goals
 
-The following are M3+ and are deliberately not in M2:
+The following are M4+ and are deliberately not in M3:
 
 - Real KIND_PDXFS_FILE(read) syscalls (blocked on R42 substrate).
 - Real KIND_TTY(write) syscalls (blocked on shell.M4 handoff).
-- Real KIND_IPC_ENDPOINT stdin frames (blocked on shell.M2).
+- Real KIND_IPC_ENDPOINT stdin frames (blocked on shell.M2
+  pipeline mint).
+- Real libpdx-semantic-pipe `Passthrough::pipe_forward` /
+  `Send::send_frame` binding (blocked on libpdx-semantic-pipe.M2
+  + downstream KIND_IPC_ENDPOINT). M3's `PipeOut::pipe_forward_*`
+  routes frames through TtySink so the wire bytes remain
+  observable to the M4 harness.
+- Real libpdx-audit `audit_begin` + `audit_record_output` +
+  `audit_commit` binding (blocked on the `svc.audit-journal`
+  broker cap, a shell.M2 concern). M3's `AuditStub` collapses the
+  three-call sequence into one atomic
+  `audit_stub_file_read(path_ptr)` call.
+- Real R42 `.pdxfs` schema-metadata lookup
+  (`sys_pdxfs_getxattr(handle, "pdxfs.schema", ...)` or inline
+  cap-descriptor field). M3's `FileSchema` per-handle table is
+  test-seedable via `file_schema_seed`.
+- v1.0 RawByteChunk@0.1 canonical schema-hash fingerprint. M3
+  ships the placeholder pattern (0x1111... / 0x2222... /
+  0x3333... / 0x4444...); v1.0 recomputes from the canonical
+  schema DDL — consumers keyed off the M3 value must re-key at
+  release time (tracked at cat.M5).
 - Migration to libpdx-argv (unblocked by libpdx-argv M2-001;
-  scheduled at cat.M3 for byte-compat with M1 fixtures).
-- Schema-typed passthrough via `Passthrough::pipe_forward`
-  (M3-001).
-- RawByteChunk[] emission for schemaless files (M3-002).
-- FileReadRecord audit via libpdx-audit (M3-003).
+  scheduled at cat.M3 in plan §5.5, but deferred pending a
+  cross-repo pass on the argv shape).
+- Correctness matrix + smoke fixtures + pre-release fuzzers
+  (M4-001 through M4-004).
 - Signed release + `.pdxdoc` (M5-001).

@@ -1,0 +1,263 @@
+// src/audit_stub.pdx — cat.M3-003
+// AuditStub module: stub for libpdx-audit per-file FileReadRecord.
+//
+// Design context
+// --------------
+// The D3 audit-first invariant (`design/tooling/plan.md` §3) says
+// every operation — read as well as write — journals to
+// `/system/audit/user-events/` BEFORE it emits any user-visible
+// output. For `cat` at M3 that means one FileReadRecord per file
+// argument, written before the first byte of that file's rendered
+// output reaches the sink. If the audit journal is unreachable or
+// full, `cat` refuses to emit and exits with code 3 (system error
+// per I4 in `design/tooling/plan.md` §4.2).
+//
+// R42-substrate note (per r49-r50-plan.md §5.5 M3-003)
+// ----------------------------------------------------
+// The real integration goes through `libpdx-audit` at
+// `paideia-os/libpdx-audit` — AuditClient::audit_begin +
+// audit_record_output + audit_commit call sequence, wiring
+// through AuditBroker to `svc.audit-journal` via sys_ipc_send
+// (sysno 42). That library exists at HEAD (2026-08-21) but the
+// cap-table plumbing needed to hand `cat` a KIND_IPC_ENDPOINT
+// bound to `svc.audit-journal` is a shell.M2 concern — shell mints
+// endpoint caps at exec, and shell.M2 has not landed yet.
+//
+// M3 ships against a local stub whose SHAPE matches what the real
+// integration will do: one audit "record" per file read, atomic
+// begin+commit, refuse-output on failure. `audit_stub_file_read`
+// wraps what the real library exposes as begin+record_output+
+// commit — that atomization is a stub-only simplification. When
+// libpdx-audit wires in, this module's body flips to three real
+// library calls; `cat_dispatch`'s per-file audit call site does
+// not change.
+//
+// Contract
+// --------
+//   audit_stub_reset : () -> () !{mem} @{}
+//     Zero all AuditStub .bss state. Called once by `cat_dispatch`
+//     before the per-file loop so a fresh invocation starts from
+//     a known baseline. The M4 test harness may re-seed
+//     `_audit_broker_failed` after this via
+//     `audit_stub_seed_broker_failure(1)` to exercise the exit-3
+//     path.
+//
+//   audit_stub_file_read : (u64) -> u64 !{mem} @{}
+//     RDI: path_ptr (NUL-terminated file path; recorded verbatim
+//          into the stub's per-file audit slot)
+//     RAX: 0 on success (audit "committed"; file bytes may now be
+//          emitted); 1 on broker unreachable (caller MUST exit 3
+//          per D3 audit-first).
+//     Increments `_audit_file_count` on success; sets
+//     `_audit_last_path_ptr` to `path_ptr`. On broker-failure
+//     (test-seeded via `audit_stub_seed_broker_failure`), returns
+//     1 without incrementing.
+//
+//   audit_stub_can_emit : () -> u64 !{mem} @{}
+//     RAX: 1 iff safe to emit output; 0 if the sticky
+//          `_audit_broker_failed` flag is set. Mirrors
+//          `AuditClient::audit_can_emit_output` in libpdx-audit.
+//
+//   audit_stub_seed_broker_failure : (u64) -> () !{mem} @{}
+//     RDI: 0 (clear) or 1 (force broker-failed on next call)
+//     M4 test harness helper. Real libpdx-audit has no such
+//     seed — the broker state is inherent to the IPC path.
+//
+//   audit_stub_get_count : () -> u64 !{mem} @{}
+//     RAX: `_audit_file_count`. M4 test harness observability
+//          helper (asserts one audit per file argument).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`AuditStub`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - All immediates in `cmp reg, imm` ≤ 0x7FFFFFFF (max 1).
+//   - r11 scratch (paideia-as reserved); reloaded before every
+//     `.bss` read/write.
+//   - No byte reads in this module — all state is u64-wide.
+//   - All functions are leaf (no `call` inside); no push/pop
+//     parity to preserve.
+
+module AuditStub = structure {
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+  pub let AS_OK                    : u64 = 0
+  pub let AS_ERR_BROKER_UNAVAIL    : u64 = 1
+
+  // ============================================================================
+  // .bss state (bootstrap-scope; M4 migrates to caller-owned)
+  //
+  // All slot names prefixed `_audit_` to avoid unqualified-name
+  // collisions with the future real libpdx-audit symbols (matches
+  // the R48 vello↔vrr `vrc_→vrenc_` rename policy).
+  // ============================================================================
+
+  // Sticky failure flag. Once set, every audit_stub_file_read call
+  // returns AS_ERR_BROKER_UNAVAIL and audit_stub_can_emit returns 0.
+  // Test-seedable via audit_stub_seed_broker_failure.
+  pub let mut _audit_broker_failed : u64 = uninit @align(8)
+
+  // Monotonic count of successful per-file audit records. M4
+  // harness asserts this equals the number of file arguments cat
+  // processed to completion.
+  pub let mut _audit_file_count : u64 = uninit @align(8)
+
+  // Most recent per-file audit's path pointer (bookkeeping /
+  // debugging; the real libpdx-audit journals the pointer's
+  // contents into the record body — the stub just records the
+  // pointer itself).
+  pub let mut _audit_last_path_ptr : u64 = uninit @align(8)
+
+  // ============================================================================
+  // audit_stub_reset()
+  //
+  // Signature: audit_stub_reset : () -> () !{mem} @{}
+  //
+  // Zero all AuditStub .bss slots. Leaf; r11 scratch.
+  // ============================================================================
+  pub let audit_stub_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-003 audit_stub_reset. Zero _audit_broker_failed, _audit_file_count, _audit_last_path_ptr so a fresh cat invocation starts from a clean audit baseline. Leaf function; r11 scratch. Real libpdx-audit's AuditRecord::reset zeroes analogous state (record_state, audit_id_next, record_op_name_ptr, ...); this stub's reset is invariant-shape with that call — when the library wires in, this function's body flips to `AuditRecord::reset()` and the .bss slots go away.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _audit_broker_failed]; mov [r11], rax;
+        lea r11, [rip + _audit_file_count];    mov [r11], rax;
+        lea r11, [rip + _audit_last_path_ptr]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_stub_file_read(path_ptr) -> rc
+  //
+  // Signature: audit_stub_file_read : (u64) -> u64 !{mem} @{}
+  //   RDI: path_ptr (NUL-terminated file-path string; recorded)
+  //   RAX: AS_OK (0) on success, AS_ERR_BROKER_UNAVAIL (1) on
+  //        broker unreachable (caller MUST exit 3 per D3).
+  //
+  // Atomic begin+commit for a per-file FileReadRecord. The real
+  // libpdx-audit sequence is audit_begin("cat_file_read", args) →
+  // audit_record_output(id, "FileReadRecord@0.1", body_hash) →
+  // audit_commit(id, 0); this stub collapses that into one call
+  // because the stub carries no in-flight audit state — each
+  // call is self-contained.
+  //
+  // Failure model: if _audit_broker_failed is set (M4 test seed
+  // or, at real-library integration time, a genuine IPC-send
+  // failure), return AS_ERR_BROKER_UNAVAIL immediately without
+  // touching _audit_file_count. On success, increment
+  // _audit_file_count and stash path_ptr into
+  // _audit_last_path_ptr.
+  //
+  // Leaf function; r11 scratch. Return in rax.
+  // ============================================================================
+  pub let audit_stub_file_read : (u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-003 audit_stub_file_read. Atomic begin+commit for one per-file FileReadRecord — the real libpdx-audit three-call sequence (audit_begin + audit_record_output + audit_commit) is collapsed here because the stub carries no in-flight audit state per call. Broker-failure gate FIRST: `cmp rax, 0; jne af_fail` — sticky _audit_broker_failed set returns AS_ERR_BROKER_UNAVAIL (1) without touching the file count, matching the D3 audit-first refuse-output shape (caller MUST exit 3). On success: increment _audit_file_count and store path_ptr in _audit_last_path_ptr (M4 test harness observability). All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max: 1 for broker-failed check). Leaf function; r11 scratch; rax as return. When libpdx-audit wires in, this body flips to three real library calls and the .bss slots go away — cat_dispatch's per-file audit call site is invariant across the migration.",
+      block: {
+        // ---- Broker-failure gate --------------------------------------
+        lea r11, [rip + _audit_broker_failed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne af_fail;
+
+        // ---- Bookkeeping: stash path_ptr ------------------------------
+        lea r11, [rip + _audit_last_path_ptr];
+        mov [r11], rdi;
+
+        // ---- Bump _audit_file_count -----------------------------------
+        lea r11, [rip + _audit_file_count];
+        mov rax, [r11];
+        add rax, 1;
+        lea r11, [rip + _audit_file_count];
+        mov [r11], rax;
+
+        xor rax, rax;                    // AS_OK
+        ret
+
+      af_fail:
+        mov rax, 1;                      // AS_ERR_BROKER_UNAVAIL
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_stub_can_emit() -> u64
+  //
+  // Signature: audit_stub_can_emit : () -> u64 !{mem} @{}
+  //   RAX: 1 iff safe to emit output; 0 if _audit_broker_failed set.
+  //
+  // Mirrors AuditClient::audit_can_emit_output in libpdx-audit.
+  // Consumers wrap every user-visible write with a pre-check on
+  // this — the D3 audit-first invariant says a tool whose audit
+  // trail was not journalled cannot be trusted.
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let audit_stub_can_emit : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-003 audit_stub_can_emit. Mirrors libpdx-audit's AuditClient::audit_can_emit_output. One .bss load of _audit_broker_failed + one `cmp reg, 0` (no test mnemonic). Flag == 0 → return 1 (safe to emit); flag != 0 → return 0 (refuse output, caller exits 3 per I4). Pure leaf; r11 scratch; rax as return. Immediates: 0 (flag compare) + 1 (safe return value) — both within paideia-as cmp-imm bounds.",
+      block: {
+        lea r11, [rip + _audit_broker_failed];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne ace_no;
+
+        mov rax, 1;
+        ret
+
+      ace_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_stub_seed_broker_failure(flag) -> ()
+  //
+  // Signature: audit_stub_seed_broker_failure : (u64) -> () !{mem} @{}
+  //   RDI: 0 (clear) or non-zero (set)
+  //
+  // M4 test harness helper. Real libpdx-audit has no such seed —
+  // the broker state is inherent to the IPC path.
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let audit_stub_seed_broker_failure : (u64) -> () !{mem} @{} =
+    fn (flag: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-003 audit_stub_seed_broker_failure. M4 test harness helper — sets _audit_broker_failed to the caller-supplied value so tests can exercise the D3 refuse-output path without a live broker. Real libpdx-audit has no such seed. Leaf function; r11 scratch. No compare needed — the value is written verbatim.",
+      block: {
+        lea r11, [rip + _audit_broker_failed];
+        mov [r11], rdi;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_stub_get_count() -> u64
+  //
+  // Signature: audit_stub_get_count : () -> u64 !{mem} @{}
+  //   RAX: _audit_file_count
+  //
+  // M4 test harness observability — asserts the audit-per-file
+  // invariant.
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let audit_stub_get_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-003 audit_stub_get_count. M4 test harness observability helper — returns _audit_file_count so tests can assert one audit-per-file. Leaf function; r11 scratch; rax as return.",
+      block: {
+        lea r11, [rip + _audit_file_count];
+        mov rax, [r11];
+        ret
+      }
+    }
+}
