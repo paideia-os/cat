@@ -1,0 +1,374 @@
+// tests/m4_002_schema_passthrough.pdx — cat.M4-002
+// CatM4002 module: schema-typed passthrough against known-schema
+// fixture.
+//
+// Purpose
+// -------
+// Prove that when the `--schema` flag is set AND the file's
+// `.pdxfs` metadata declares a schema (stubbed here via
+// `file_schema_seed`), `cat_dispatch` routes the file's bytes
+// through `PipeOut::pipe_forward_write` — emitting an R20b
+// semantic-pipe frame with the schema's 32-byte hash prefix
+// followed by the body bytes — instead of the M2 render-text path.
+// This is the M3-001 correctness invariant of `cat`'s
+// schema-declared branch (`design/tooling/r49-r50-plan.md` §5.5).
+//
+// Fixture shape
+// -------------
+//   argv        = [ "cat"\0 , "--schema"\0 , "file_a"\0 ]   argc = 3
+//   FileRead seed 1: 17 bytes of 0x42 ('B')      handle 1
+//   FileSchema seed handle 1 → 32-byte hash of repeating 0xEE
+//
+// Because `pipe_forward_write` sub-chunks at
+// `SP_MAX_RECORD_BODY = 4056` bytes and our body is 17 bytes,
+// exactly ONE frame is emitted. Frame layout (57 bytes total):
+//
+//   +0   op         = 0x01  (SP_OP_TYPED_RECORD)
+//   +1   ver        = 0x01  (SP_VER)
+//   +2   flags LE  = 0x0001 (SP_FLAG_HAS_HASH)
+//         [+2] = 0x01, [+3] = 0x00
+//   +4   payload_len LE u32 = 32 + 17 = 49 = 0x31
+//         [+4] = 0x31, [+5..+7] = 0x00
+//   +8   schema_hash [u8; 32]  = 32 × 0xEE
+//   +40  body        [u8; 17]  = 17 × 0x42
+//
+// Total sink length = 8 (header) + 32 (hash) + 17 (body) = 57.
+//
+// Assertions
+// ----------
+//   1. cat_dispatch(&argv, 3) returns CAT_EXIT_OK (0).
+//   2. TtySink::tty_out_len == 57.
+//   3. AuditStub::_audit_file_count == 1 (one FileReadRecord).
+//   4. Sink header bytes at offset 0..8 match the expected
+//      op/ver/flags/payload_len pattern.
+//   5. Sink hash bytes at offset 8..40 are all 0xEE (schema
+//      fingerprint passthrough — 32-byte prefix).
+//   6. Sink body bytes at offset 40..57 are all 0x42 (schema
+//      body passthrough — original file bytes).
+//
+// The three passthrough checks together prove:
+//   - The 32-byte hash pointer stored via `file_schema_seed`
+//     survived the round trip through `file_schema_query` and
+//     `pipe_forward_frame`'s hash-emit loop.
+//   - The 17-byte body bytes survived the round trip through
+//     `file_read_chunk` (via `fr_chunk_buf`) and
+//     `pipe_forward_frame`'s body-emit loop.
+//   - No schemaless-path bytes leaked in — `rbc_reset` /
+//     `rbc_emit_chunk` were NOT called because the schema
+//     branch took over.
+//
+// Return codes from `test_cat_m4_002_schema_passthrough`
+// ------------------------------------------------------
+//   0  — PASS
+//   1  — cat_dispatch returned non-zero exit code
+//   2  — tty_out_len != 57
+//   3  — audit count != 1
+//   4  — sink header byte mismatch
+//   5  — sink hash byte mismatch
+//   6  — sink body byte mismatch
+//
+// paideia-as compliance
+// ---------------------
+//   - Module basename `CatM4002` (PascalCase), no directory prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     57 for the sink-length check; 40 for the body-scan bound).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `test_cat_m4_002_schema_passthrough` is non-leaf: 5-push
+//     callee-save prologue lands rsp%16 == 0 at every nested
+//     call site.
+//   - `.bss` slot names prefixed `m4_002_` to sidestep cross-repo
+//     unqualified-name collisions.
+
+module CatM4002 = structure {
+
+  // ============================================================================
+  // Fixture .bss
+  // ============================================================================
+
+  // 17-byte body: 17 × 0x42 ('B'). Populated via fill-loop in
+  // test_main. Padded to 24 to keep 8-byte alignment on the next
+  // slot.
+  pub let mut m4_002_src_a : [u8; 24] = uninit @align(8)
+
+  // 32-byte schema hash: 32 × 0xEE. Populated via 4 × qword stores.
+  pub let mut m4_002_schema_hash : [u64; 4] = uninit @align(8)
+
+  // Path strings.
+  //   argv[0] = "cat\0"
+  //   argv[1] = "--schema\0"
+  //   argv[2] = "a\0"
+  pub let mut m4_002_argv0    : [u8; 8]  = uninit @align(8)
+  pub let mut m4_002_flag_str : [u8; 16] = uninit @align(8)
+  pub let mut m4_002_path_a   : [u8; 8]  = uninit @align(8)
+
+  // argv[3] pointer array.
+  pub let mut m4_002_argv : [u64; 3] = uninit @align(8)
+
+  // ============================================================================
+  // test_cat_m4_002_schema_passthrough() -> u64
+  //
+  // Signature: test_cat_m4_002_schema_passthrough : () -> u64 !{mem} @{}
+  //   RAX: 0 on PASS, distinct non-zero per assertion failure.
+  //
+  // Non-leaf; 5-push callee-save prologue.
+  // ============================================================================
+  pub let test_cat_m4_002_schema_passthrough : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M4-002 schema-typed passthrough test. Populates a 17-byte body (17 × 0x42) via a per-byte fill-loop bounded by `cmp rcx, 17; jge`; populates a 32-byte schema hash via 4 × qword stores of 0xEEEEEEEEEEEEEEEE (32 × 0xEE). Populates argv[3] = { &'cat\\0', &'--schema\\0', &'a\\0' } — the '--schema' string exercises cat_parse_argv's long-flag whitelist byte-compare at src/argv_dispatch.pdx:227. Resets stub tables. Pushes ONE seed (src_a, 17 bytes → handle 1). Seeds file_schema for handle 1 with the hash pointer. Calls cat_dispatch(argv, 3). Asserts: (1) exit == 0; (2) tty_out_len == 57 = 8-byte header + 32-byte hash + 17-byte body; (3) audit_stub_get_count == 1; (4) sink header bytes match { 0x01, 0x01, 0x01, 0x00, 0x31, 0x00, 0x00, 0x00 } — the R20b frame op/ver/flags LE u16/payload_len LE u32 with payload_len = 32 + 17 = 49 = 0x31 (matches pipe_forward_frame's inline header composition at src/pipe_out.pdx:178..229); (5) sink hash bytes 8..40 all == 0xEE (proves the hash-emit loop copied all 32 bytes verbatim from the caller's hash_ptr); (6) sink body bytes 40..57 all == 0x42 (proves the body-emit loop copied all 17 bytes verbatim from the caller's body_ptr). Together the three passthrough checks prove: (a) file_schema_query returned the seeded hash pointer for handle 1 (not 0 — else the RBC path would have taken over and emitted the placeholder pattern); (b) pipe_forward_write's sub-chunk sizing picked 17 (not 4056) for the tail chunk; (c) pipe_forward_frame's hash + body copy loops preserved byte order. Distinct non-zero exit codes per assertion (1..6) let a driver decode which check tripped. 5-push callee-save prologue (rbx = sink base, r12 = scan cursor, r13 = expected header byte / scan end, r14 = expected byte value for hash/body, r15 = pad) lands rsp%16 == 0 at every nested call site. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max: 57 for sink-length check).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ==============================================================
+        // Populate 17-byte body with 0x42 ('B') via fill-loop.
+        // ==============================================================
+        xor rcx, rcx;
+      m4_002_fill_body_head:
+        cmp rcx, 17;
+        jge m4_002_fill_body_done;
+        lea r11, [rip + m4_002_src_a];
+        add r11, rcx;
+        mov rax, 0x42;
+        mov_b [r11], rax;
+        add rcx, 1;
+        jmp m4_002_fill_body_head;
+      m4_002_fill_body_done:
+
+        // ==============================================================
+        // Populate 32-byte schema hash via 4 × qword stores of
+        // 0xEEEEEEEEEEEEEEEE (i.e. 8 × 0xEE per qword).
+        // ==============================================================
+        mov rax, 0xEEEEEEEEEEEEEEEE;
+        lea r11, [rip + m4_002_schema_hash];
+        mov [r11 + 0*8], rax;
+        lea r11, [rip + m4_002_schema_hash];
+        mov [r11 + 1*8], rax;
+        lea r11, [rip + m4_002_schema_hash];
+        mov [r11 + 2*8], rax;
+        lea r11, [rip + m4_002_schema_hash];
+        mov [r11 + 3*8], rax;
+
+        // ==============================================================
+        // Populate argv[0] = "cat\0".
+        // ==============================================================
+        lea r11, [rip + m4_002_argv0];
+        mov rax, 0x63; mov_b [r11], rax;
+        lea r11, [rip + m4_002_argv0]; add r11, 1;
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_002_argv0]; add r11, 2;
+        mov rax, 0x74; mov_b [r11], rax;
+        lea r11, [rip + m4_002_argv0]; add r11, 3;
+        xor rax, rax; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv[1] = "--schema\0". Byte layout must match
+        // cat_parse_argv's whitelist at src/argv_dispatch.pdx:227..233:
+        //   [0]='-' [1]='-' [2]='s' [3]='c' [4]='h' [5]='e' [6]='m'
+        //   [7]='a' [8]='\0'
+        // ==============================================================
+        lea r11, [rip + m4_002_flag_str];
+        mov rax, 0x2D; mov_b [r11], rax;         // '-'
+        lea r11, [rip + m4_002_flag_str]; add r11, 1;
+        mov rax, 0x2D; mov_b [r11], rax;         // '-'
+        lea r11, [rip + m4_002_flag_str]; add r11, 2;
+        mov rax, 0x73; mov_b [r11], rax;         // 's'
+        lea r11, [rip + m4_002_flag_str]; add r11, 3;
+        mov rax, 0x63; mov_b [r11], rax;         // 'c'
+        lea r11, [rip + m4_002_flag_str]; add r11, 4;
+        mov rax, 0x68; mov_b [r11], rax;         // 'h'
+        lea r11, [rip + m4_002_flag_str]; add r11, 5;
+        mov rax, 0x65; mov_b [r11], rax;         // 'e'
+        lea r11, [rip + m4_002_flag_str]; add r11, 6;
+        mov rax, 0x6D; mov_b [r11], rax;         // 'm'
+        lea r11, [rip + m4_002_flag_str]; add r11, 7;
+        mov rax, 0x61; mov_b [r11], rax;         // 'a'
+        lea r11, [rip + m4_002_flag_str]; add r11, 8;
+        xor rax, rax; mov_b [r11], rax;          // '\0'
+
+        // ==============================================================
+        // Populate argv[2] = "a\0".
+        // ==============================================================
+        lea r11, [rip + m4_002_path_a];
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_002_path_a]; add r11, 1;
+        xor rax, rax; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv pointer array.
+        // ==============================================================
+        lea r11, [rip + m4_002_argv];
+        lea rax, [rip + m4_002_argv0];
+        mov [r11 + 0*8], rax;
+        lea r11, [rip + m4_002_argv];
+        lea rax, [rip + m4_002_flag_str];
+        mov [r11 + 1*8], rax;
+        lea r11, [rip + m4_002_argv];
+        lea rax, [rip + m4_002_path_a];
+        mov [r11 + 2*8], rax;
+
+        // ==============================================================
+        // Reset stub state.
+        // ==============================================================
+        call file_read_reset;
+        call stdin_reset;
+        call audit_stub_reset;
+        call file_schema_reset;
+
+        // ==============================================================
+        // Seed FileRead (handle 1 → src_a, 17 bytes) and FileSchema
+        // (handle 1 → &schema_hash).
+        // ==============================================================
+        lea rdi, [rip + m4_002_src_a];
+        mov rsi, 17;
+        call file_read_seed_push;
+
+        mov rdi, 1;                              // handle 1
+        lea rsi, [rip + m4_002_schema_hash];
+        call file_schema_seed;
+
+        // ==============================================================
+        // Dispatch.
+        // ==============================================================
+        lea rdi, [rip + m4_002_argv];
+        mov rsi, 3;
+        call cat_dispatch;
+        cmp rax, 0;
+        jne m4_002_fail_exit;
+
+        // ==============================================================
+        // Assertion 2: TtySink::tty_out_len == 57.
+        // ==============================================================
+        lea r11, [rip + tty_out_len];
+        mov rax, [r11];
+        cmp rax, 57;
+        jne m4_002_fail_len;
+
+        // ==============================================================
+        // Assertion 3: audit count == 1.
+        // ==============================================================
+        call audit_stub_get_count;
+        cmp rax, 1;
+        jne m4_002_fail_audit;
+
+        // ==============================================================
+        // Assertion 4: sink header bytes at offset 0..8.
+        // Expected: { 0x01, 0x01, 0x01, 0x00, 0x31, 0x00, 0x00, 0x00 }
+        // ==============================================================
+        lea rbx, [rip + tty_out_buf];
+
+        // byte 0 = op = 0x01
+        lea r11, [rbx + 0];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x01;
+        jne m4_002_fail_hdr;
+
+        // byte 1 = ver = 0x01
+        lea r11, [rbx + 1];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x01;
+        jne m4_002_fail_hdr;
+
+        // byte 2 = flags LE lo = 0x01
+        lea r11, [rbx + 2];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x01;
+        jne m4_002_fail_hdr;
+
+        // byte 3 = flags LE hi = 0x00
+        lea r11, [rbx + 3];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x00;
+        jne m4_002_fail_hdr;
+
+        // byte 4 = payload_len LE byte 0 = (32 + 17) & 0xFF = 49 = 0x31
+        lea r11, [rbx + 4];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x31;
+        jne m4_002_fail_hdr;
+
+        // bytes 5..7 = payload_len LE bytes 1..3 = 0x00
+        lea r11, [rbx + 5];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x00;
+        jne m4_002_fail_hdr;
+        lea r11, [rbx + 6];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x00;
+        jne m4_002_fail_hdr;
+        lea r11, [rbx + 7];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x00;
+        jne m4_002_fail_hdr;
+
+        // ==============================================================
+        // Assertion 5: sink hash bytes at offset 8..40 all == 0xEE.
+        // ==============================================================
+        mov r12, 8;                              // scan cursor
+      m4_002_scan_hash_head:
+        cmp r12, 40;
+        jge m4_002_scan_hash_done;
+        lea r11, [rbx + r12*1];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0xEE;
+        jne m4_002_fail_hash;
+        add r12, 1;
+        jmp m4_002_scan_hash_head;
+      m4_002_scan_hash_done:
+
+        // ==============================================================
+        // Assertion 6: sink body bytes at offset 40..57 all == 0x42.
+        // ==============================================================
+        mov r12, 40;
+      m4_002_scan_body_head:
+        cmp r12, 57;
+        jge m4_002_pass;
+        lea r11, [rbx + r12*1];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x42;
+        jne m4_002_fail_body;
+        add r12, 1;
+        jmp m4_002_scan_body_head;
+
+      m4_002_pass:
+        xor rax, rax;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_exit:
+        mov rax, 1;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_len:
+        mov rax, 2;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_audit:
+        mov rax, 3;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_hdr:
+        mov rax, 4;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_hash:
+        mov rax, 5;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_002_fail_body:
+        mov rax, 6;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+      }
+    }
+}
