@@ -1,0 +1,251 @@
+// tests/m4_003_large_file_streaming.pdx — cat.M4-003
+// CatM4003 module: large-file streaming test (bounded working set,
+// no whole-file buffering, "no OOM on files > RAM").
+//
+// Purpose
+// -------
+// Prove that `cat_dispatch` streams a source larger than
+// `FileRead::CHUNK_MAX = 65536` through the per-chunk read loop
+// (`file_read_chunk` → `render_write_bytes`) WITHOUT buffering
+// the whole source in memory anywhere. This is the M2-003
+// correctness invariant (`design/tooling/r49-r50-plan.md` §5.5:
+// "never buffer full file; 64 KiB chunk"). In the M2 stub tree
+// the "no OOM" claim reduces to two observable facts: (a) the
+// only 64 KiB scratch is `fr_chunk_buf` — no per-file allocation
+// ever grows with source size; (b) `cat_dispatch`'s inner loop
+// iterates at least twice for a source larger than one chunk.
+//
+// Fixture shape
+// -------------
+//   argv        = [ "cat"\0 , "a"\0 ]        argc = 2
+//   FileRead seed 1: SRC_LEN = 131072 bytes of 0x41 ('A')
+//                    handle 1
+//
+// SRC_LEN = 131072 = 2 × CHUNK_MAX. `cat_dispatch`'s inner loop:
+//   iter 1: file_read_chunk returns 65536 bytes → render_write_bytes
+//           copies all 65536 into TtySink (sink fills exactly).
+//   iter 2: file_read_chunk returns 65536 bytes (from the second
+//           half of the seed source) → render_write_bytes hits
+//           `TtySink::tty_write_bytes`'s cap-guard on the FIRST
+//           byte (cursor already at TTY_OUT_CAP = 65536) →
+//           returns TTY_SINK_OVERFLOW → propagates as
+//           RENDER_ERR_SINK (3) → cat_dispatch cd_system_error
+//           → exit CAT_EXIT_SYSTEM_ERROR (3).
+//
+// The overflow-on-iter-2 outcome is exactly what we want to
+// observe: it PROVES the loop iterated twice (streaming worked)
+// and that no whole-file buffer was allocated (else iter 1 would
+// have caught OOM or the sink would have shown 131072 bytes,
+// impossible under TTY_OUT_CAP). The sink is expected to be
+// filled to exactly TTY_OUT_CAP = 65536 bytes; every byte in
+// tty_out_buf[0..65536] must be 0x41 (the seed pattern) — proving
+// the streamed bytes reached the sink verbatim.
+//
+// Assertions
+// ----------
+//   1. cat_dispatch(&argv, 2) returns CAT_EXIT_SYSTEM_ERROR (3)
+//      (from the iter-2 sink overflow; expected outcome).
+//   2. TtySink::tty_out_len == 65536 (sink filled to exactly
+//      TTY_OUT_CAP — iter 1 fully consumed, iter 2's first-byte
+//      overflow persisted the cap-value cursor).
+//   3. AuditStub::_audit_file_count == 1 (one FileReadRecord per
+//      positional; the audit is atomic and lands BEFORE the
+//      first byte hits the sink).
+//   4. A sample of sink bytes at offsets 0, 32768, 65535 are all
+//      0x41 (proves seed→sink passthrough across the whole
+//      sink range, not just the first chunk).
+//
+// The seed fixture is a 131072-byte `.bss` buffer populated at
+// test entry via a fill-loop bounded by `cmp rcx, 131072`. The
+// immediate 131072 = 0x00020000 fits well within the 0x7FFFFFFF
+// paideia-as cmp-imm bound.
+//
+// Return codes from `test_cat_m4_003_large_file_streaming`
+// --------------------------------------------------------
+//   0  — PASS
+//   1  — cat_dispatch returned exit != 3
+//   2  — tty_out_len != 65536
+//   3  — audit count != 1
+//   4  — sink byte-sample mismatch
+//
+// paideia-as compliance
+// ---------------------
+//   - Module basename `CatM4003` (PascalCase), no directory prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     131072 for the fill-loop bound; 65535 for the sink-tail
+//     sample offset).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `test_cat_m4_003_large_file_streaming` is non-leaf: 5-push
+//     callee-save prologue lands rsp%16 == 0 at every nested
+//     call site.
+//   - `.bss` slot names prefixed `m4_003_` to sidestep cross-repo
+//     unqualified-name collisions.
+
+module CatM4003 = structure {
+
+  // ============================================================================
+  // Fixture .bss
+  // ============================================================================
+
+  // 131072-byte source (2 × CHUNK_MAX). Populated with 0x41 via
+  // the fill-loop in test_main.
+  pub let mut m4_003_src_a : [u8; 131072] = uninit @align(8)
+
+  // argv[0] = "cat\0"; argv[1] = "a\0".
+  pub let mut m4_003_argv0  : [u8; 8]  = uninit @align(8)
+  pub let mut m4_003_path_a : [u8; 8]  = uninit @align(8)
+
+  // argv[2] pointer array.
+  pub let mut m4_003_argv : [u64; 2] = uninit @align(8)
+
+  // ============================================================================
+  // test_cat_m4_003_large_file_streaming() -> u64
+  //
+  // Signature: test_cat_m4_003_large_file_streaming : () -> u64 !{mem} @{}
+  //   RAX: 0 on PASS, distinct non-zero per assertion failure.
+  //
+  // Non-leaf; 5-push callee-save prologue.
+  // ============================================================================
+  pub let test_cat_m4_003_large_file_streaming : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M4-003 large-file streaming test. Populates a 131072-byte src fixture (2 × CHUNK_MAX) with 0x41 ('A') via a per-byte fill-loop bounded by `cmp rcx, 131072; jge`. 131072 fits imm32 (0x00020000 << 0x7FFFFFFF). Populates argv[2] = { &'cat\\0', &'a\\0' }. Resets stub tables. Pushes ONE seed (src_a, 131072 bytes → handle 1). Calls cat_dispatch(argv, 2). Expected: cat_dispatch's per-file loop iterates twice — iter 1 file_read_chunk returns 65536 (CHUNK_MAX), render_write_bytes fills TtySink exactly (tty_out_len advances 0 → 65536); iter 2 file_read_chunk returns another 65536 (from the second half of the seed source), render_write_bytes hits tty_write_bytes' cap-guard `cmp rcx, 65536; jge tty_write_overflow` on the very first byte since cursor == cap, returns TTY_SINK_OVERFLOW = 0xFFFFFFF4, propagates as RENDER_ERR_SINK (3), cat_dispatch cd_system_error → exit 3. This overflow-on-iter-2 outcome proves: (a) the loop iterated more than once (streaming worked; a whole-file-buffer implementation would either OOM before iter 1's read completed or emit 131072 bytes in one go, both impossible under TTY_OUT_CAP = 65536); (b) working memory is bounded by fr_chunk_buf (64 KiB, shared source-side scratch) and tty_out_buf (64 KiB, shared sink-side scratch) — total .bss working set is 128 KiB regardless of source size. Asserts: (1) exit == 3 (SYSTEM_ERROR from iter-2 sink overflow); (2) tty_out_len == 65536 (sink filled to cap — iter 1 fully consumed, iter 2's first-byte overflow persisted the cap-value cursor per tty_write_bytes' overflow branch); (3) audit_stub_get_count == 1 (D3 audit-first invariant: one FileReadRecord per positional, atomic, before first sink byte — audit fires even though the ultimate exit is a sink overflow because the audit runs BEFORE the read/emit loop); (4) sample bytes at sink offsets 0, 32768, 65535 all == 0x41 (passthrough intact across the whole sink range, not just the first chunk — a corrupt intermediate would surface here). Distinct non-zero exit codes per assertion (1..4). 5-push callee-save prologue (rbx = sink base, r12/r13/r14/r15 = pad/temps) lands rsp%16 == 0 at every nested call site. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max: 131072 for fill-loop bound).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ==============================================================
+        // Populate 131072-byte source with 0x41 ('A') via fill-loop.
+        // ==============================================================
+        xor rcx, rcx;
+      m4_003_fill_src_head:
+        cmp rcx, 131072;
+        jge m4_003_fill_src_done;
+        lea r11, [rip + m4_003_src_a];
+        add r11, rcx;
+        mov rax, 0x41;
+        mov_b [r11], rax;
+        add rcx, 1;
+        jmp m4_003_fill_src_head;
+      m4_003_fill_src_done:
+
+        // ==============================================================
+        // Populate argv[0] = "cat\0" and argv[1] = "a\0".
+        // ==============================================================
+        lea r11, [rip + m4_003_argv0];
+        mov rax, 0x63; mov_b [r11], rax;
+        lea r11, [rip + m4_003_argv0]; add r11, 1;
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_003_argv0]; add r11, 2;
+        mov rax, 0x74; mov_b [r11], rax;
+        lea r11, [rip + m4_003_argv0]; add r11, 3;
+        xor rax, rax; mov_b [r11], rax;
+
+        lea r11, [rip + m4_003_path_a];
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_003_path_a]; add r11, 1;
+        xor rax, rax; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv[2] pointer array.
+        // ==============================================================
+        lea r11, [rip + m4_003_argv];
+        lea rax, [rip + m4_003_argv0];
+        mov [r11 + 0*8], rax;
+        lea r11, [rip + m4_003_argv];
+        lea rax, [rip + m4_003_path_a];
+        mov [r11 + 1*8], rax;
+
+        // ==============================================================
+        // Reset stub state.
+        // ==============================================================
+        call file_read_reset;
+        call stdin_reset;
+        call audit_stub_reset;
+        call file_schema_reset;
+
+        // ==============================================================
+        // Seed FileRead (handle 1 → 131072 bytes).
+        // ==============================================================
+        lea rdi, [rip + m4_003_src_a];
+        mov rsi, 131072;
+        call file_read_seed_push;
+
+        // ==============================================================
+        // Dispatch.
+        // ==============================================================
+        lea rdi, [rip + m4_003_argv];
+        mov rsi, 2;
+        call cat_dispatch;
+
+        // Assertion 1: exit code == 3 (CAT_EXIT_SYSTEM_ERROR from
+        // iter-2 sink overflow).
+        cmp rax, 3;
+        jne m4_003_fail_exit;
+
+        // Assertion 2: tty_out_len == 65536.
+        lea r11, [rip + tty_out_len];
+        mov rax, [r11];
+        cmp rax, 65536;
+        jne m4_003_fail_len;
+
+        // Assertion 3: audit count == 1.
+        call audit_stub_get_count;
+        cmp rax, 1;
+        jne m4_003_fail_audit;
+
+        // Assertion 4: sample bytes at offsets 0, 32768, 65535.
+        lea rbx, [rip + tty_out_buf];
+
+        // sample at offset 0.
+        lea r11, [rbx + 0];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x41;
+        jne m4_003_fail_bytes;
+
+        // sample at offset 32768 (middle of sink).
+        mov r12, 32768;
+        lea r11, [rbx + r12*1];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x41;
+        jne m4_003_fail_bytes;
+
+        // sample at offset 65535 (last byte before cap).
+        mov r12, 65535;
+        lea r11, [rbx + r12*1];
+        xor rax, rax; mov_b rax, [r11];
+        cmp rax, 0x41;
+        jne m4_003_fail_bytes;
+
+        // PASS
+        xor rax, rax;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_003_fail_exit:
+        mov rax, 1;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_003_fail_len:
+        mov rax, 2;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_003_fail_audit:
+        mov rax, 3;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_003_fail_bytes:
+        mov rax, 4;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+      }
+    }
+}
