@@ -1,0 +1,308 @@
+// src/raw_byte_chunk.pdx — cat.M3-002
+// RawByteChunk module: schemaless-file emission via RawByteChunk@0.1
+// records on the semantic-pipe layer.
+//
+// Design context
+// --------------
+// When cat is invoked with `--schema` on a file whose `.pdxfs`
+// metadata declares no schema, the M2 render-text path would
+// leave downstream consumers with nothing to filter or plot by.
+// M3-002 fills that gap: cat wraps the raw bytes in RawByteChunk
+// records so downstream tools can still window the stream by
+// byte range (offset + bytes) without re-tokenizing.
+//
+// Record schema — RawByteChunk@0.1 (declared in caps.decl)
+// --------------------------------------------------------
+//   offset : u64 LE   file byte offset of the first byte in bytes
+//   bytes  : [u8]     up to RBC_MAX_BODY (4048) bytes of payload
+//
+// One RawByteChunk record per emitted frame; the frame's schema
+// hash prefix is the RawByteChunk@0.1 fingerprint (a fixed 32-byte
+// constant, RBC_SCHEMA_HASH, defined in this module). Per-frame
+// body cap = SP_MAX_RECORD_BODY (4056) − 8 (offset field) = 4048.
+//
+// Offset semantics
+// ----------------
+// Per-file offset: the first record for each file argument starts
+// at offset=0, and each subsequent record's offset = previous
+// record's offset + previous record's bytes-count. Matches how a
+// consumer would seek within a single-file byte stream. The
+// per-file offset resets between files via rbc_reset().
+//
+// Contract
+// --------
+//   rbc_reset : () -> () !{mem} @{}
+//     Zero _rbc_file_offset. Called at the top of every per-file
+//     RBC-path inner loop in cat_dispatch so a new file starts
+//     at offset 0.
+//
+//   rbc_emit_chunk : (u64, u64) -> u64 !{mem} @{}
+//     RDI: src_ptr (chunk_buf holding up to 65536 file bytes)
+//     RSI: len     (bytes actually populated in src)
+//     RAX: RBC_OK (0) / RBC_ERR_SINK (3)
+//     Sub-chunks len bytes into ≤ RBC_MAX_BODY (4048) byte records.
+//     For each sub-chunk: composes [offset:u64 LE | bytes] into
+//     _rbc_scratch, then emits one PipeOut::pipe_forward_frame
+//     with the RawByteChunk schema hash. Advances _rbc_file_offset
+//     by sub-chunk size after each emit.
+//
+//   rbc_get_offset : () -> u64 !{mem} @{}
+//     RAX: current _rbc_file_offset. M4 test observability.
+//
+// Schema-hash provenance
+// ----------------------
+// RBC_SCHEMA_HASH is a deterministic 32-byte constant standing in
+// for the BLAKE3-truncated fingerprint of the RawByteChunk@0.1
+// schema definition. The v1.0 release (cat.M5) will recompute
+// this from the canonical schema DDL and update the constant;
+// consumers keyed off the M3 placeholder value will need to
+// re-key at that point. Placeholder pattern is a repeating
+// nibble sequence chosen to be trivially spottable in a hex
+// dump.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`RawByteChunk`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - All immediates in `cmp reg, imm` ≤ 0x7FFFFFFF (max 4048).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `rbc_reset` and `rbc_get_offset` are leaf. `rbc_emit_chunk`
+//     is non-leaf with a 5-push callee-save prologue (rsp%16 == 0
+//     at every nested call site).
+//   - `add reg, -imm` per M2 style ban on `sub`.
+//   - No `sub reg, reg`.
+
+module RawByteChunk = structure {
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+  pub let RBC_OK        : u64 = 0
+  pub let RBC_ERR_SINK  : u64 = 3
+
+  // ============================================================================
+  // Sub-chunk body cap: SP_MAX_RECORD_BODY (4056) − 8 (offset
+  // prefix) = 4048.
+  // ============================================================================
+  pub let RBC_MAX_BODY  : u64 = 4048
+
+  // ============================================================================
+  // RBC_SCHEMA_HASH — RawByteChunk@0.1 fingerprint placeholder.
+  //
+  // 32 bytes = 4 u64 words, little-endian pattern. Recomputed at
+  // v1.0 from the canonical schema DDL. Consumers should treat
+  // the M3 value as unstable.
+  // ============================================================================
+  pub let mut _rbc_schema_hash : [u64; 4] = uninit @align(8)
+
+  // ============================================================================
+  // Per-file offset — advanced by rbc_emit_chunk; reset at file
+  // boundary by cat_dispatch calling rbc_reset.
+  // ============================================================================
+  pub let mut _rbc_file_offset : u64 = uninit @align(8)
+
+  // ============================================================================
+  // Record body staging buffer — holds one RawByteChunk record's
+  // composed body [8B offset | up-to-4048B bytes]. Body cap 4056
+  // matches SP_MAX_RECORD_BODY.
+  // ============================================================================
+  pub let mut _rbc_scratch : [u8; 4056] = uninit @align(8)
+
+  // ============================================================================
+  // rbc_reset()
+  //
+  // Signature: rbc_reset : () -> () !{mem} @{}
+  //
+  // Initialise _rbc_schema_hash to the placeholder pattern and
+  // zero _rbc_file_offset. Called by cat_dispatch at the top of
+  // every per-file RBC-path inner loop (so offset re-zeros
+  // between files).
+  //
+  // Leaf; r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let rbc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-002 rbc_reset. Two responsibilities: (1) install the RawByteChunk@0.1 placeholder schema-hash pattern into _rbc_schema_hash (4 qwords: 0x1111111111111111 / 0x2222222222222222 / 0x3333333333333333 / 0x4444444444444444 — trivially spottable in a hex dump; will be replaced by BLAKE3 fingerprint at v1.0). (2) Zero _rbc_file_offset so the first record of the current file starts at offset 0. Called at the top of every per-file RBC-path inner loop in cat_dispatch. Leaf function; r11 scratch. All immediates fit imm32.",
+      block: {
+        // Install schema-hash placeholder pattern.
+        mov rax, 0x1111111111111111;
+        lea r11, [rip + _rbc_schema_hash];
+        mov [r11 + 0*8], rax;
+
+        mov rax, 0x2222222222222222;
+        lea r11, [rip + _rbc_schema_hash];
+        mov [r11 + 1*8], rax;
+
+        mov rax, 0x3333333333333333;
+        lea r11, [rip + _rbc_schema_hash];
+        mov [r11 + 2*8], rax;
+
+        mov rax, 0x4444444444444444;
+        lea r11, [rip + _rbc_schema_hash];
+        mov [r11 + 3*8], rax;
+
+        // Zero _rbc_file_offset.
+        xor rax, rax;
+        lea r11, [rip + _rbc_file_offset];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // rbc_emit_chunk(src, len) -> rc
+  //
+  // Signature: rbc_emit_chunk : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: src (chunk_buf holding file bytes)
+  //   RSI: len (bytes populated)
+  //   RAX: RBC_OK / RBC_ERR_SINK
+  //
+  // For each ≤ RBC_MAX_BODY (4048) byte sub-chunk of src:
+  //   1. Write current _rbc_file_offset LE into _rbc_scratch[0..8].
+  //   2. Copy src[sub_offset..sub_offset+sub_len] into
+  //      _rbc_scratch[8..8+sub_len].
+  //   3. Emit PipeOut::pipe_forward_frame(&_rbc_schema_hash,
+  //      &_rbc_scratch, 8 + sub_len).
+  //   4. Advance _rbc_file_offset by sub_len.
+  //
+  // Register plan (5-push callee-save prologue):
+  //   rbx = src walking cursor (advances by 1 per copied byte)
+  //   r12 = src_end (src + len)
+  //   r13 = current sub_len counter (0 .. RBC_MAX_BODY = 4048)
+  //   r14 = sub_len snapshot preserved across the nested
+  //         pipe_forward_frame call so the post-call offset
+  //         advance can bump _rbc_file_offset by sub_len
+  //   r15 = alignment pad (unused)
+  //   rax = byte load / call return
+  //   rcx = offset temp (during scratch header write)
+  //   rdi/rsi/rdx = call args
+  //   r11 = lea scratch (paideia-as reserved)
+  // ============================================================================
+  pub let rbc_emit_chunk : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-002 rbc_emit_chunk. For each ≤ RBC_MAX_BODY (4048) byte sub-chunk of src: (1) write _rbc_file_offset LE u64 into _rbc_scratch[0..8] as an 8-byte-at-a-time qword store (natural alignment — _rbc_scratch is @align(8)); (2) byte-copy src[sub_offset..sub_offset+sub_len] into _rbc_scratch[8..8+sub_len] via `xor rax,rax; mov_b rax,[rbx]; lea r11,[_rbc_scratch + 8 + i]; mov_b [r11],rax` per byte (#1248 mitigation); (3) call PipeOut::pipe_forward_frame(&_rbc_schema_hash, &_rbc_scratch, 8 + sub_len); (4) advance _rbc_file_offset by sub_len via .bss read + add + store. Sub-chunk sizing: `cmp bytes_left, 4048; jle last_chunk` picks 4048 for full and residue for tail — same shape as PipeOut::pipe_forward_write. Loop-guard `cmp rbx, r12; jge done` terminates when src fully consumed. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 4048). 5-push callee-save prologue (rbx=src_cursor / r12=src_end / r13=sub_len / r14=scratch_write_cursor / r15=pad) lands rsp%16 == 0 at every nested pipe_forward_frame call site. Every pipe_forward_frame return checked via `cmp rax, 0; jne rec_err` — propagates RBC_ERR_SINK on sink overflow.",
+      block: {
+        // ---- Prologue: 5 pushes for 16-byte alignment ------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // rbx = src walking cursor
+        mov r12, rdi;
+        add r12, rsi;                     // r12 = src_end
+
+        // Empty write is a no-op.
+        cmp rbx, r12;
+        jge rec_ok;
+
+      rec_head:
+        // Guard: src exhausted → done
+        cmp rbx, r12;
+        jge rec_ok;
+
+        // Sub-chunk sizing is implicit: the byte-copy loop below
+        // increments both the src cursor (rbx) and a fresh sub_len
+        // counter (r13) per byte, terminating when EITHER r13 hits
+        // RBC_MAX_BODY (4048) OR rbx hits src_end (r12). This avoids
+        // computing `remaining = r12 - rbx` (paideia-as bans `sub` and
+        // has no `add reg, -reg` form).
+
+        // ---- Compose scratch header: offset LE u64 --------------------
+        lea r11, [rip + _rbc_file_offset];
+        mov rcx, [r11];
+        lea r11, [rip + _rbc_scratch];
+        mov [r11 + 0], rcx;               // qword store — offset LE
+
+        // ---- Byte-copy src → _rbc_scratch[8..], accumulating sub_len -
+        xor r13, r13;                     // sub_len = 0
+
+      rec_copy_head:
+        // Termination: sub_len hit RBC_MAX_BODY.
+        cmp r13, 4048;                    // RBC_MAX_BODY
+        jge rec_copy_done;
+        // Termination: src exhausted.
+        cmp rbx, r12;
+        jge rec_copy_done;
+
+        // Load src byte.
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // Store into _rbc_scratch[8 + sub_len].
+        lea r11, [rip + _rbc_scratch];
+        add r11, 8;                       // skip 8-byte offset header
+        add r11, r13;                     // + sub_len cursor
+        mov_b [r11], rax;
+
+        add rbx, 1;                       // src cursor++
+        add r13, 1;                       // sub_len++
+        jmp rec_copy_head;
+
+      rec_copy_done:
+        // ---- Emit frame: pipe_forward_frame(hash, scratch, 8+sub_len)
+        lea rdi, [rip + _rbc_schema_hash];
+        lea rsi, [rip + _rbc_scratch];
+        mov rdx, r13;
+        add rdx, 8;                       // body_len = offset (8) + sub_len
+        // Save sub_len across the call via r14 (unused pad, in prologue).
+        mov r14, r13;
+        call pipe_forward_frame;
+        cmp rax, 0;
+        jne rec_err;
+
+        // ---- Advance _rbc_file_offset by sub_len (r14) ----------------
+        lea r11, [rip + _rbc_file_offset];
+        mov rax, [r11];
+        add rax, r14;
+        lea r11, [rip + _rbc_file_offset];
+        mov [r11], rax;
+
+        // Continue to next sub-chunk.
+        jmp rec_head;
+
+      rec_ok:
+        xor rax, rax;                     // RBC_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      rec_err:
+        // rax already holds pipe_forward_frame's error rc; propagate.
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // rbc_get_offset() -> u64
+  //
+  // Signature: rbc_get_offset : () -> u64 !{mem} @{}
+  //   RAX: current _rbc_file_offset
+  //
+  // M4 test-harness observability — asserts offset advancement.
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let rbc_get_offset : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-002 rbc_get_offset. M4 test-harness observability helper — returns _rbc_file_offset. Leaf function; r11 scratch; rax as return.",
+      block: {
+        lea r11, [rip + _rbc_file_offset];
+        mov rax, [r11];
+        ret
+      }
+    }
+}
