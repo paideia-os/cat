@@ -1,0 +1,246 @@
+// src/argv_dispatch.pdx — cat.M1-001 (skeleton)
+// CatDispatch module: argv → first-positional scan → (stubbed) file
+// read → exit code.
+//
+// M1-001 lands the skeleton: the exit-code vocabulary, the
+// single-positional argv scan, the file-read stub call site (kept
+// external so M1-003 can wire in the real FileRead module without
+// re-editing this file's control flow). M1-002 replaces the inline
+// argv scan with a full flag+positional parser (`cat_parse_argv`).
+// M1-003 wires the TtySink at the "write bytes" call site and adds
+// the alt entry `cat_dispatch_from_buf`.
+//
+// The signature freezes at M1-001 so M1-002 and M1-003 are
+// body-only edits: `cat_dispatch(argv, argc) → exit_code` is the
+// entry point every downstream caller pins against.
+//
+// Exit-code discipline (per I4 in design/tooling/plan.md §4.2):
+//   0 — read + wrote successfully
+//   2 — usage error (missing file, unknown flag, name too long)
+//   3 — system error (sink overflow at M1; file-read I/O at M2+)
+//   4 — cap denied / file not found (stubbed until M2)
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`CatDispatch`), no directory
+//     prefix (per feedback_paideia_os_loop_shape).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (the M1
+//     constants are 0x2D for '-' and 236 for NAME_MAX_LEN — both
+//     comfortably below the bound).
+//   - r11 scratch (paideia-as reserved); reloaded before every
+//     .bss read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248
+//     mitigation).
+//   - SysV push/pop parity: `cat_dispatch` pushes r12/r13/r14 in
+//     prologue, mirror-order pop in epilogue. Every nested call
+//     site sees rsp % 16 == 0.
+
+module CatDispatch = structure {
+
+  // ============================================================================
+  // Exit codes (per I4 collapsed vocabulary)
+  // ============================================================================
+  pub let CAT_EXIT_OK               : u64 = 0
+  pub let CAT_EXIT_USAGE_ERROR      : u64 = 2
+  pub let CAT_EXIT_SYSTEM_ERROR     : u64 = 3
+  pub let CAT_EXIT_CAP_DENIED       : u64 = 4
+
+  // ============================================================================
+  // Argv-scan constants
+  // ============================================================================
+
+  // Max length of a positional file name (in bytes, excluding NUL).
+  // 4 KiB is the M1 KIND_PDXFS_FILE path bound per r49-r50-plan.md §2.4;
+  // the M1 skeleton uses 236 to match the /system/doc/<name>.pdxdoc
+  // ceiling in the doc reader — a shared upper bound that keeps the
+  // hand-audit surface small across the R49/R50 tools until R42
+  // substrate normalizes the path-length quota.
+  pub let NAME_MAX_LEN : u64 = 236
+
+  // ============================================================================
+  // Singleton .bss (bootstrap-scope; M4 migrates to caller-owned)
+  // ============================================================================
+
+  // Pointer to the first positional argv entry (interior into
+  // caller-owned argv memory). 0 until the M1-001 scan finds it.
+  // M1-002 replaces this with the `pos_ptrs` array below (this slot
+  // is retained for M1-001-shape backward compat during the M1-002
+  // transition and is removed at M2-001 when the multi-file loop
+  // supersedes it).
+  pub let mut first_positional_ptr : u64 = uninit @align(8)
+
+  // Length in bytes of the first positional name (excluding NUL).
+  // 0 until scanned.
+  pub let mut first_positional_len : u64 = uninit @align(8)
+
+  // ============================================================================
+  // cat_dispatch(argv, argc) -> exit_code
+  //
+  // Signature: cat_dispatch : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: argv (u64* — array of NUL-terminated arg pointers)
+  //   RSI: argc (count of entries in argv)
+  //   RAX: exit code (0 / 2 / 3 / 4 per I4)
+  //
+  // M1-001 flow:
+  //   1. Inline argv scan for the first positional argument
+  //      (skipping any argv[i] whose first byte is '-'). No first
+  //      positional → CAT_EXIT_USAGE_ERROR.
+  //   2. Compute name_len by walking bytes to NUL. name_len >
+  //      NAME_MAX_LEN → CAT_EXIT_USAGE_ERROR (name too long).
+  //   3. Call file_read_stub (M1-001: inline stub returning 0; M1-003
+  //      replaces the call target with FileRead::file_read_stub in
+  //      src/file_read.pdx). Stub returns rax=0 → CAT_EXIT_CAP_DENIED.
+  //
+  // M1-002 replaces the inline argv scan with `cat_parse_argv` and
+  // iterates over `pos_ptrs`; M1-003 adds the tty_write_bytes tail
+  // and the alt entry `cat_dispatch_from_buf`.
+  //
+  // Register plan (non-leaf; calls file_read_stub):
+  //   r12 = i (argv loop counter — callee-save)
+  //   r13 = argv (callee-save copy of rdi)
+  //   r14 = argc (callee-save copy of rsi)
+  //   r11 = scratch (paideia-as reserved) — reloaded before every
+  //         .bss read/write
+  //   rax = byte load / return value
+  //   rdi/rsi = call-site arg carriers
+  //   rcx/rdx = scratch (measure walk cursor + current argv[i])
+  //
+  // rsp arithmetic:
+  //   caller-of-cat_dispatch: rsp%16 == 0 immediately before call
+  //   after CALL:             rsp%16 == 8 (return address pushed)
+  //   after push r12:         rsp%16 == 0
+  //   after push r13:         rsp%16 == 8
+  //   after push r14:         rsp%16 == 0  ← every nested call ok
+  //   epilogue reverses in mirror order.
+  // ============================================================================
+  pub let cat_dispatch : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M1-001 cat_dispatch skeleton. Steps 1-3 of the M1-001 pipeline in design/architecture.md §3: inline scan of argv for the first positional (skips flags starting with '-'), NUL-terminated length compute, then file_read_stub which returns 0 at M1 (blocked on R42 substrate per r49-r50-plan.md §2.4). Non-leaf function: pushes r12+r13+r14 for callee-save parity and stack alignment (three pushes brings rsp%16 to 0 at the nested call site). Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (0x2D for '-', 236 for NAME_MAX_LEN). Byte loads always preceded by xor rax,rax (#1248 mitigation). The file_read_stub symbol resolves to a local inline definition at M1-001 (see below) and is replaced at M1-003 by FileRead::file_read_stub in src/file_read.pdx — a symbol-swap change, not a call-site change.",
+      block: {
+        // ---- prologue: save callee-save regs + align stack -------------
+        push r12;
+        push r13;
+        push r14;
+
+        mov r13, rdi;                   // r13 = argv
+        mov r14, rsi;                   // r14 = argc
+
+        // ---- Step 1: inline argv scan for first positional ------------
+        // i starts at 1 (skip argv[0] which is the program name).
+        mov r12, 1;
+
+      cat_dispatch_scan_head:
+        cmp r12, r14;
+        jge cat_dispatch_no_file;
+
+        mov rdx, [r13 + r12*8];         // rdx = argv[i]
+
+        // byte0 = rdx[0]. '-' == 0x2D. If it's '-', it's a flag; skip.
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0x2D;
+        je cat_dispatch_scan_bump;
+
+        // Non-'-' first byte → positional. First positional found.
+        lea r11, [rip + first_positional_ptr];
+        mov [r11], rdx;
+        jmp cat_dispatch_measure_name;
+
+      cat_dispatch_scan_bump:
+        add r12, 1;
+        jmp cat_dispatch_scan_head;
+
+      cat_dispatch_no_file:
+        mov rax, 2;                     // CAT_EXIT_USAGE_ERROR
+        jmp cat_dispatch_epilogue;
+
+        // ---- Step 2: measure name length (bytes to first NUL) ---------
+      cat_dispatch_measure_name:
+        // rdx still points at argv[i]. Walk to NUL; count bytes.
+        // r12 becomes the length; rcx is the walk cursor.
+        mov rcx, rdx;
+        xor r12, r12;                   // reuse r12 as len accumulator
+
+      cat_dispatch_measure_head:
+        // Bound check BEFORE the byte load so a pathological argv[i]
+        // without any NUL cannot walk off the end forever.
+        cmp r12, 236;                   // NAME_MAX_LEN
+        jg cat_dispatch_name_too_long;
+
+        xor rax, rax;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je cat_dispatch_measure_done;
+        add rcx, 1;
+        add r12, 1;
+        jmp cat_dispatch_measure_head;
+
+      cat_dispatch_measure_done:
+        // Reject len == 0 (empty positional).
+        cmp r12, 0;
+        je cat_dispatch_no_file;
+
+        lea r11, [rip + first_positional_len];
+        mov [r11], r12;
+        jmp cat_dispatch_stub_read;
+
+      cat_dispatch_name_too_long:
+        mov rax, 2;                     // CAT_EXIT_USAGE_ERROR
+        jmp cat_dispatch_epilogue;
+
+        // ---- Step 3: stub file_read (M1-001 inline; M1-003 external) --
+      cat_dispatch_stub_read:
+        call file_read_stub;
+        cmp rax, 0;
+        je cat_dispatch_cap_denied;
+
+        // M1-001: unreachable at runtime (stub always returns 0) but
+        // the fall-through arm exists so M1-003's wiring (which
+        // replaces file_read_stub's body with a real read) is a
+        // symbol-swap edit inside src/file_read.pdx and never
+        // touches this file's control flow.
+        xor rax, rax;                   // CAT_EXIT_OK (unreachable at M1)
+        jmp cat_dispatch_epilogue;
+
+      cat_dispatch_cap_denied:
+        mov rax, 4;                     // CAT_EXIT_CAP_DENIED
+        jmp cat_dispatch_epilogue;
+
+      cat_dispatch_epilogue:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_read_stub() -> src_ptr_or_zero
+  //
+  // Signature: file_read_stub : () -> u64 !{mem} @{}
+  //   RAX: 0 (M1-001 stub always returns "not found"). M1-003 replaces
+  //        this inline definition with the FileRead::file_read_stub
+  //        symbol in src/file_read.pdx (a symbol-swap change; the
+  //        call site in cat_dispatch stays as-is).
+  //
+  // Leaf function; no push/pop parity.
+  //
+  // The M1-001 definition intentionally lives in this file so the
+  // scaffold compiles standalone before file_read.pdx exists.
+  // M1-003 removes this definition and moves it to
+  // src/file_read.pdx so the linker resolves the call from
+  // cat_dispatch to the new location — this file loses the local
+  // definition but keeps the call site.
+  // ============================================================================
+  pub let file_read_stub : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M1-001 file_read_stub (inline). Returns 0 in rax unconditionally — the correct behaviour until R42 substrate (KIND_PDXFS_FILE) lands per r49-r50-plan.md §2.4. M1-003 removes this inline definition and re-hosts the same symbol in src/file_read.pdx; the call site in cat_dispatch does not change. Leaf function; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+}

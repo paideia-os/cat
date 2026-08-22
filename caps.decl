@@ -1,0 +1,47 @@
+# cat — caps.decl
+#
+# Wave: R50
+# Doc:  design/tooling/r49-r50-plan.md §4.5 and §5.5 in the paideia-os
+#       repo. This file is the invariant-I6 (capability handoff visible
+#       + refusable) manifest the shell validates at exec: cat receives
+#       exactly the caps below and no more.
+#
+# The four caps below are the minimum surface for the reader to
+# (1) identify who is reading (KIND_USER for the FileReadRecord audit
+# tail at M3), (2) locate and read the file(s) named on argv
+# (KIND_PDXFS_FILE narrowed to <arg-path> — one such cap per
+# positional file argument, so a `cat a b c` invocation carries three
+# read caps and can touch nothing else), (3) render bytes to the
+# invoker's terminal (KIND_TTY narrowed to write, no read /
+# tcsetattr), and (4) participate in the semantic-pipe layer
+# (KIND_IPC_ENDPOINT for M3-001 schema-typed passthrough / M3-002
+# RawByteChunk[] emission — declared here at M1 so consumers can
+# inspect the manifest early; the wire binding lands at M3).
+#
+# Missing caps in the received set → exit 4 (cap denied per I4 in
+# design/tooling/plan.md §4.2). Extra caps in the received set → the
+# shell's exec-time cap_manifest_verify (libpdx-cap M2-001) refuses at
+# the shell side; cat never sees them.
+#
+# Per-argument narrowing note
+# ---------------------------
+# The `KIND_PDXFS_FILE(read, <arg-path>)` line reads as "one cap per
+# positional file argument". `cat a b c` receives three distinct
+# KIND_PDXFS_FILE(read) caps — one for each of a, b, c. The shell
+# constructs these from the invoker's cap environment at exec via
+# libpdx-cap M2's cap_pack with `narrow_rights`; no wildcard subtree
+# is ever granted. If argv has zero positionals, cat reads from stdin
+# (KIND_IPC_ENDPOINT); no KIND_PDXFS_FILE cap is needed on that path.
+requires:
+  - KIND_USER
+  - KIND_TTY(write)
+  - KIND_PDXFS_FILE(read, <arg-path>)
+  - KIND_IPC_ENDPOINT
+
+# Declared output schemas — the semantic-pipe records cat emits.
+# Declared at M1 (this file) so consumers can inspect the manifest;
+# the actual wire binding + emission lands at M3-001 (schema-typed
+# passthrough) and M3-002 (RawByteChunk for schemaless files) per
+# r49-r50-plan.md §5.5.
+declares_output_schemas:
+  - RawByteChunk@0.1
