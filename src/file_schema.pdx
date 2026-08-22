@@ -1,0 +1,156 @@
+// src/file_schema.pdx — cat.M3-001
+// FileSchema module: per-handle schema-hash lookup for
+// M3-001 schema-typed passthrough.
+//
+// Design context
+// --------------
+// The R42 substrate (KIND_PDXFS_FILE) will expose per-file
+// metadata including a `.pdxfs` schema declaration — a BLAKE3-
+// truncated 32-byte fingerprint identifying the record schema of
+// the file's content. cat.M3-001 branches on this: if the file
+// declares a schema, forward records on the semantic-pipe layer
+// with that schema's hash prefix (M3-001); if no schema is
+// declared, emit RawByteChunk[] records instead (M3-002).
+//
+// R42 will land a real `sys_pdxfs_getxattr(handle, "pdxfs.schema",
+// &out_hash, 32)`-shaped syscall or an inline field on the
+// KIND_PDXFS_FILE cap descriptor. Neither exists at HEAD — this
+// module ships a test-seedable stub whose SHAPE matches the
+// eventual real lookup: `file_schema_query(handle)` returns
+// either a pointer to the file's 32-byte schema-hash or 0 for
+// no schema. M4 tests populate the per-handle table via
+// `file_schema_seed(handle, hash_ptr)` before dispatch.
+//
+// Handle indexing convention
+// --------------------------
+// Matches FileRead::fr_seed_bufs — arrays sized SEED_MAX + 1 = 9
+// slots so `_fs_hash_ptrs[handle]` addresses the schema for that
+// handle without `handle - 1` arithmetic. Slot 0 is unused.
+//
+// Contract
+// --------
+//   file_schema_reset : () -> () !{mem} @{}
+//     Zero every slot in _fs_hash_ptrs. Called by cat_dispatch
+//     before argv parsing so a fresh invocation starts from
+//     "no file has a declared schema".
+//
+//   file_schema_seed : (u64, u64) -> () !{mem} @{}
+//     RDI: handle (1..SEED_MAX)
+//     RSI: hash_ptr (pointer to caller-owned 32-byte hash; the
+//          pointer is stored verbatim, NOT copied)
+//     M4 test harness helper. Real R42 has no such seed — the
+//     schema comes from the .pdxfs metadata on open.
+//
+//   file_schema_query : (u64) -> u64 !{mem} @{}
+//     RDI: handle
+//     RAX: hash_ptr on schema-declared, 0 otherwise (including
+//          for out-of-range handles).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`FileSchema`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - All immediates in `cmp reg, imm` ≤ 0x7FFFFFFF (max 8).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - No byte reads in this module — all slots are u64 pointers.
+//   - All functions are leaf; no push/pop parity to preserve.
+
+module FileSchema = structure {
+
+  // ============================================================================
+  // Handle-table capacity — mirrors FileRead::SEED_MAX = 8.
+  // ============================================================================
+  pub let FS_SEED_MAX : u64 = 8
+
+  // ============================================================================
+  // Per-handle hash pointers. Slot 0 unused (invalid handle);
+  // slots 1..8 hold the caller-supplied hash_ptr or 0.
+  // ============================================================================
+  pub let mut _fs_hash_ptrs : [u64; 9] = uninit @align(8)
+
+  // ============================================================================
+  // file_schema_reset()
+  //
+  // Signature: file_schema_reset : () -> () !{mem} @{}
+  //
+  // Zero all 9 slots. Leaf; r11 scratch.
+  // ============================================================================
+  pub let file_schema_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 file_schema_reset. Zero all 9 slots of _fs_hash_ptrs so a fresh cat invocation defaults every handle to 'no declared schema' (file_schema_query returns 0, cat_dispatch's --schema path routes to RawByteChunk emission). Loop counter rcx 0..9 with cmp+jge termination and `mov [r11 + rcx*8], rax` store. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 9). Leaf function; r11 scratch; rax/rcx caller-save.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+      fs_reset_head:
+        cmp rcx, 9;                       // SEED_MAX + 1
+        jge fs_reset_done;
+        lea r11, [rip + _fs_hash_ptrs];
+        mov [r11 + rcx*8], rax;
+        add rcx, 1;
+        jmp fs_reset_head;
+      fs_reset_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_schema_seed(handle, hash_ptr) -> ()
+  //
+  // Signature: file_schema_seed : (u64, u64) -> () !{mem} @{}
+  //   RDI: handle (1..FS_SEED_MAX; out-of-range silently ignored)
+  //   RSI: hash_ptr (stored verbatim, not dereferenced)
+  //
+  // Leaf; r11 scratch. Out-of-range handle silently ignored
+  // (matches FileRead::file_read_seed_push's fail-quiet-on-full
+  // shape but with an implicit range check instead of an
+  // explicit rc — this is a test-only helper).
+  // ============================================================================
+  pub let file_schema_seed : (u64, u64) -> () !{mem} @{} =
+    fn (handle: u64) (hash_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 file_schema_seed. M4 test harness helper — associates a 32-byte schema hash pointer with a specific file handle. Range gates: handle == 0 → silently ignored (slot 0 is the invalid-handle sentinel); handle > FS_SEED_MAX (8) → silently ignored. On valid handle, store hash_ptr verbatim into _fs_hash_ptrs[handle]. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 8). Leaf function; r11 scratch; rax as scratch.",
+      block: {
+        cmp rdi, 0;
+        je fs_seed_done;
+        cmp rdi, 8;                       // FS_SEED_MAX
+        jg fs_seed_done;
+
+        lea r11, [rip + _fs_hash_ptrs];
+        mov [r11 + rdi*8], rsi;
+
+      fs_seed_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_schema_query(handle) -> u64
+  //
+  // Signature: file_schema_query : (u64) -> u64 !{mem} @{}
+  //   RDI: handle
+  //   RAX: hash_ptr if a schema was seeded for handle; 0 otherwise
+  //        (including for out-of-range handles).
+  //
+  // Leaf; r11 scratch.
+  // ============================================================================
+  pub let file_schema_query : (u64) -> u64 !{mem} @{} =
+    fn (handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 file_schema_query. Called by cat_dispatch per file to decide the --schema path: hash_ptr != 0 → schema-typed passthrough (M3-001); hash_ptr == 0 → RawByteChunk emission (M3-002). Range gates: handle == 0 → 0; handle > FS_SEED_MAX (8) → 0. On valid handle, load _fs_hash_ptrs[handle] into rax and return it. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 8). Leaf function; r11 scratch; rax as return.",
+      block: {
+        cmp rdi, 0;
+        je fs_query_none;
+        cmp rdi, 8;                       // FS_SEED_MAX
+        jg fs_query_none;
+
+        lea r11, [rip + _fs_hash_ptrs];
+        mov rax, [r11 + rdi*8];
+        ret
+
+      fs_query_none:
+        xor rax, rax;
+        ret
+      }
+    }
+}

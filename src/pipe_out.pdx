@@ -1,0 +1,407 @@
+// src/pipe_out.pdx — cat.M3-001 (shared by M3-002)
+// PipeOut module: semantic-pipe frame emitter (stub).
+//
+// Design context
+// --------------
+// The D2 semantic-pipe layer (`design/tooling/plan.md` §3) says
+// every tool emits both text and typed-schema records on its
+// stdout. `cat` at M3 gains the typed-schema layer: when
+// `--schema` is set on the argv, each source chunk is wrapped in
+// an R20b IPC frame carrying a 32-byte schema hash prefix, so
+// downstream consumers that know the schema can decode without
+// re-tokenizing the byte stream. Cross-repo library that owns
+// the wire format is `paideia-os/libpdx-semantic-pipe` (§5.11 in
+// r49-r50-plan.md).
+//
+// Wire format — R20b frame + schema-hash prefix
+// ---------------------------------------------
+//   +0   op         u8    = SP_OP_TYPED_RECORD (0x01)
+//   +1   ver        u8    = SP_VER (0x01)
+//   +2   flags      u16   LE = SP_FLAG_HAS_HASH (0x0001)
+//   +4   payload_len u32  LE = SP_SCHEMA_HASH_SIZE (32) + body_len
+//   +8   schema_hash [u8; 32]  BLAKE3-truncated fingerprint
+//   +40  body        [u8; body_len]  caller's payload
+//
+// The 8-byte header + 32-byte hash + body_len bytes total
+// (40 + body_len). body_len is capped at SP_MAX_RECORD_BODY =
+// 4056 (SP_MAX_PAYLOAD 4088 − 32). Larger writes fan out into
+// multiple frames via `pipe_forward_write`.
+//
+// At M3 the frame stream is written into `TtySink::tty_out_buf`
+// via `tty_write_byte` so the M4 test harness can inspect it in
+// the sink buffer. When libpdx-semantic-pipe wires in (needs a
+// `KIND_IPC_ENDPOINT` cap bound to a downstream consumer, which
+// is a shell.M2 concern), this module's body flips to
+// `Send::send_frame` / `Passthrough::pipe_forward` — the
+// dispatch call site does not change.
+//
+// Contract
+// --------
+//   pipe_out_reset : () -> () !{mem} @{}
+//     No .bss state at M3 (all writes go through TtySink whose
+//     own reset zeroes the sink cursor). Reset call kept for
+//     symmetry — real libpdx-semantic-pipe will grow per-fd
+//     binding state that needs zeroing.
+//
+//   pipe_forward_frame : (u64, u64, u64) -> u64 !{mem} @{}
+//     RDI: hash_ptr (32-byte schema-hash prefix)
+//     RSI: body_ptr (payload body)
+//     RDX: body_len (≤ SP_MAX_RECORD_BODY = 4056; caller must
+//          sub-chunk larger writes via pipe_forward_write)
+//     RAX: PO_OK (0) on success, PO_ERR_BODY_TOO_LONG (1) on
+//          body_len > 4056, PO_ERR_SINK (3) on sink overflow.
+//     Emits ONE frame [8B hdr | 32B hash | body_len B body] into
+//     TtySink via tty_write_byte per byte.
+//
+//   pipe_forward_write : (u64, u64, u64) -> u64 !{mem} @{}
+//     RDI: hash_ptr
+//     RSI: src_ptr
+//     RDX: total_len
+//     RAX: PO_OK / PO_ERR_SINK.
+//     Sub-chunks src into ≤ SP_MAX_RECORD_BODY frames and calls
+//     pipe_forward_frame once per sub-chunk. Body_len for the
+//     last sub-chunk is (total_len - N*4056) which may be < 4056.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`PipeOut`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - All immediates in `cmp reg, imm` ≤ 0x7FFFFFFF (max 4056).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `pipe_out_reset` is leaf. `pipe_forward_frame` non-leaf
+//     (many tty_write_byte calls) — 5-push callee-save prologue
+//     (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every
+//     nested call site. `pipe_forward_write` non-leaf — 5-push
+//     prologue for the sub-chunk loop.
+//   - `add reg, -imm` allowed for arithmetic (per M2 style ban
+//     on `sub` mnemonic carried forward from architecture.md §5);
+//     `add reg, reg` used for cursor advance.
+
+module PipeOut = structure {
+
+  // ============================================================================
+  // Result codes
+  // ============================================================================
+  pub let PO_OK                    : u64 = 0
+  pub let PO_ERR_BODY_TOO_LONG     : u64 = 1
+  pub let PO_ERR_SINK              : u64 = 3
+
+  // ============================================================================
+  // Wire-format constants (mirrors libpdx-semantic-pipe/src/envelope.pdx)
+  // ============================================================================
+  pub let SP_FRAME_HEADER_SIZE : u64 = 8
+  pub let SP_SCHEMA_HASH_SIZE  : u64 = 32
+  pub let SP_MAX_RECORD_BODY   : u64 = 4056     // SP_MAX_PAYLOAD 4088 - 32
+
+  // Frame header byte constants (per file-header wire format).
+  pub let SP_OP_TYPED_RECORD   : u64 = 0x01
+  pub let SP_VER               : u64 = 0x01
+  pub let SP_FLAG_HAS_HASH_LO  : u64 = 0x01     // flags LE byte 0
+  pub let SP_FLAG_HAS_HASH_HI  : u64 = 0x00     // flags LE byte 1
+
+  // ============================================================================
+  // pipe_out_reset()
+  //
+  // Signature: pipe_out_reset : () -> () !{mem} @{}
+  //
+  // No PipeOut-owned .bss state at M3. Call kept for symmetry
+  // with the future real libpdx-semantic-pipe binding table.
+  //
+  // Leaf; no push/pop parity.
+  // ============================================================================
+  pub let pipe_out_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 pipe_out_reset. M3 stub carries no PipeOut-owned .bss state — every write goes through TtySink whose own reset (called separately by cat_dispatch) zeroes the sink cursor. The reset entry is kept as an API stub for symmetry with libpdx-semantic-pipe's future per-fd binding-table reset (Binding::reset in libpdx-semantic-pipe/src/binding.pdx). Leaf function; single-ret; no push/pop parity.",
+      block: {
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pipe_forward_frame(hash_ptr, body_ptr, body_len) -> rc
+  //
+  // Signature: pipe_forward_frame : (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI: hash_ptr (32-byte schema-hash prefix)
+  //   RSI: body_ptr (payload body base)
+  //   RDX: body_len (≤ SP_MAX_RECORD_BODY = 4056)
+  //   RAX: PO_OK (0) / PO_ERR_BODY_TOO_LONG (1) / PO_ERR_SINK (3)
+  //
+  // Emits one wire frame [8B hdr | 32B hash | body_len B body]
+  // into TtySink via tty_write_byte per byte. Header composed
+  // inline: op / ver / flags LE u16 / payload_len LE u32 =
+  // 32 + body_len.
+  //
+  // Register plan (5-push callee-save prologue for 16-byte align):
+  //   rbx = hash_ptr (walked with a cursor r15 to preserve it if needed)
+  //   r12 = body_ptr walking cursor (advances byte-by-byte)
+  //   r13 = body_end (body_ptr + body_len)
+  //   r14 = payload_len = 32 + body_len (needed for header emit)
+  //   r15 = hash walking cursor (hash_ptr .. hash_ptr+32)
+  //   rax = byte load / tty_write_byte return
+  //   rdi = tty_write_byte arg
+  //   r11 = lea scratch (paideia-as reserved)
+  //
+  // rsp arithmetic: entry rsp%16 == 8 (post-CALL). 5 pushes lands
+  // rsp%16 == 0 at every nested tty_write_byte call site.
+  // ============================================================================
+  pub let pipe_forward_frame : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (hash_ptr: u64) (body_ptr: u64) (body_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 pipe_forward_frame. Emit ONE R20b IPC frame with schema-hash prefix into TtySink via tty_write_byte per byte. Body_len gate: `cmp rdx, 4056; ja pff_too_long` — SP_MAX_RECORD_BODY = SP_MAX_PAYLOAD (4088) − SP_SCHEMA_HASH_SIZE (32). Header composition inline (matches libpdx-semantic-pipe/src/send.pdx §send_record header-first discipline): op=0x01 → ver=0x01 → flags LE (lo=0x01, hi=0x00) → payload_len LE u32 (= 32 + body_len). payload_len write is 4 bytes little-endian via 4 successive tty_write_byte calls after byte-shifting r14 through and+shr. Hash-body copy: r15 walks hash_ptr..hash_ptr+32, r12 walks body_ptr..body_ptr+body_len — each iteration loads via `xor rax,rax; mov_b rax,[r15/r12]` (#1248) and calls tty_write_byte, checking `cmp rax, 0; jne pff_err_sink` for TTY_SINK_OVERFLOW propagation. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max: 4056 for body-len gate). 5-push callee-save prologue (rbx=hash_ptr / r12=body_cursor / r13=body_end / r14=payload_len / r15=hash_cursor) lands rsp%16 == 0 at every nested tty_write_byte call site. Return in rax: PO_OK on clean emit, PO_ERR_BODY_TOO_LONG on gate failure (bare return, no push cleanup — the gate is before the prologue), PO_ERR_SINK on any tty_write_byte overflow (via epilogue).",
+      block: {
+        // ---- Pre-prologue body_len gate --------------------------------
+        cmp rdx, 4056;                    // SP_MAX_RECORD_BODY
+        ja pff_too_long_no_pop;
+
+        // ---- Prologue: 5 pushes for 16-byte alignment ------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // rbx = hash_ptr
+        mov r12, rsi;                     // r12 = body_ptr walking cursor
+        mov r13, rsi;
+        add r13, rdx;                     // r13 = body_end
+
+        // payload_len = 32 + body_len
+        mov r14, rdx;
+        add r14, 32;                      // r14 = payload_len
+
+        // ==============================================================
+        //  Header emit (8 bytes)
+        // ==============================================================
+
+        // byte 0: op = SP_OP_TYPED_RECORD (0x01)
+        mov rdi, 0x01;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        // byte 1: ver = SP_VER (0x01)
+        mov rdi, 0x01;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        // byte 2: flags LE lo = 0x01 (SP_FLAG_HAS_HASH bit 0)
+        mov rdi, 0x01;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        // byte 3: flags LE hi = 0x00
+        xor rdi, rdi;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        // bytes 4..7: payload_len LE u32 = r14 low 32 bits.
+        //   Emit low byte of r14 four times, shifting right 8 each step.
+        mov rdi, r14;
+        and rdi, 0xFF;                    // byte 4 = payload_len & 0xFF
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        shr r14, 8;
+        mov rdi, r14;
+        and rdi, 0xFF;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        shr r14, 8;
+        mov rdi, r14;
+        and rdi, 0xFF;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        shr r14, 8;
+        mov rdi, r14;
+        and rdi, 0xFF;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        // ==============================================================
+        //  Hash emit (32 bytes)
+        // ==============================================================
+        mov r15, rbx;                     // r15 = hash walking cursor
+        mov r14, rbx;
+        add r14, 32;                      // r14 = hash_end
+
+      pff_hash_head:
+        cmp r15, r14;
+        jge pff_body_start;
+
+        xor rax, rax;
+        mov_b rax, [r15];
+        mov rdi, rax;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        add r15, 1;
+        jmp pff_hash_head;
+
+        // ==============================================================
+        //  Body emit (body_len bytes)
+        // ==============================================================
+      pff_body_start:
+      pff_body_head:
+        cmp r12, r13;
+        jge pff_ok;
+
+        xor rax, rax;
+        mov_b rax, [r12];
+        mov rdi, rax;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne pff_err_sink;
+
+        add r12, 1;
+        jmp pff_body_head;
+
+      pff_ok:
+        xor rax, rax;                     // PO_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      pff_err_sink:
+        mov rax, 3;                       // PO_ERR_SINK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      pff_too_long_no_pop:
+        mov rax, 1;                       // PO_ERR_BODY_TOO_LONG (bare return, pre-prologue)
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pipe_forward_write(hash_ptr, src_ptr, total_len) -> rc
+  //
+  // Signature: pipe_forward_write : (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI: hash_ptr
+  //   RSI: src_ptr
+  //   RDX: total_len
+  //   RAX: PO_OK / PO_ERR_SINK
+  //
+  // Sub-chunks src into ≤ SP_MAX_RECORD_BODY (4056) byte frames,
+  // calling pipe_forward_frame once per sub-chunk. The tail
+  // sub-chunk is (total_len mod 4056) which may be 0 — in that
+  // case no tail frame is emitted (total_len exactly on a 4056
+  // multiple).
+  //
+  // Register plan (5-push callee-save prologue):
+  //   rbx = hash_ptr (preserved across pipe_forward_frame calls)
+  //   r12 = src walking cursor (starts at src_ptr; advances by
+  //         sub-chunk size per iter)
+  //   r13 = src_end (src_ptr + total_len)
+  //   r14 = bytes_left countdown (decremented by 4056 on full
+  //         chunks; the last chunk exits via r12 == r13 instead)
+  //   r15 = sub_len scratch, preserved across the nested call so
+  //         the post-call `add r12, r15` can advance the src
+  //         cursor
+  //   rax = call return
+  //   rdi/rsi/rdx = call args
+  // ============================================================================
+  pub let pipe_forward_write : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (hash_ptr: u64) (src_ptr: u64) (total_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M3-001 pipe_forward_write. Sub-chunks total_len bytes at src into ≤ SP_MAX_RECORD_BODY (4056) byte frames, calling pipe_forward_frame once per sub-chunk. Sub-chunk sizing runs a countdown: r14 holds bytes_left (initialised to total_len). Per-iter: `cmp r14, 0; jle pfw_ok` on exhaustion; else `cmp r14, 4056; jg pfw_full_chunk` picks 4056 for full and r14 for the tail. paideia-as bans the `sub` mnemonic and does not admit `add reg, -reg`, so bytes_left is decremented only on the full-chunk path (`add r14, -4056` — signed imm32 form per design/architecture.md §5, matches Render::render_write_bytes's digit-place ladder). The last-chunk path skips the decrement and terminates on `cmp r12, r13; jge pfw_ok` — the src walking cursor r12 advanced by sub_len (`add r12, r15`) reaches src_end r13 exactly. rbx preserves the hash pointer across every nested pipe_forward_frame call. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 4056). 5-push callee-save prologue (rbx=hash / r12=src_cursor / r13=src_end / r14=bytes_left / r15=sub_len scratch) lands rsp%16 == 0 at every nested pipe_forward_frame call site.",
+      block: {
+        // ---- Prologue: 5 pushes for 16-byte alignment ------------------
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // rbx = hash_ptr
+        mov r12, rsi;                     // r12 = src walking cursor
+        mov r13, rsi;
+        add r13, rdx;                     // r13 = src_end
+        mov r14, rdx;                     // r14 = bytes_left
+
+      pfw_head:
+        // Guard: bytes_left <= 0 → done
+        cmp r14, 0;
+        jle pfw_ok;
+
+        // Pick sub-chunk size: min(4056, bytes_left)
+        cmp r14, 4056;                    // SP_MAX_RECORD_BODY
+        jg pfw_full_chunk;
+
+        // Last (partial) chunk — sub_len = r14
+        mov rdx, r14;
+        jmp pfw_call;
+
+      pfw_full_chunk:
+        mov rdx, 4056;                    // SP_MAX_RECORD_BODY
+
+      pfw_call:
+        // pipe_forward_frame(hash=rbx, body=r12, body_len=rdx)
+        //   Preserve rdx across the call via r15 (unused pad).
+        mov r15, rdx;
+        mov rdi, rbx;
+        mov rsi, r12;
+        // rdx already holds sub_len
+        call pipe_forward_frame;
+        cmp rax, 0;
+        jne pfw_err;
+
+        // Advance src_cursor by sub_len (in r15). paideia-as has no
+        // `add reg, -reg` form and bans `sub`, so we cannot compute
+        // `r14 -= r15` directly. Instead: only the full-chunk path
+        // decrements bytes_left, and it decrements by a fixed imm
+        // (`add r14, -4056`). The last-chunk path skips the decrement
+        // and terminates on the src_cursor == src_end check below.
+        add r12, r15;                     // src_cursor += sub_len
+
+        // If this was the last (partial) sub-chunk (sub_len < 4056),
+        // bytes_left is now sub_len - sub_len == 0 conceptually — but
+        // we don't track it precisely, we just re-check the loop guard
+        // via cmp r12, r13.
+        cmp r12, r13;
+        jge pfw_ok;
+
+        // Else this was a full 4056-byte sub-chunk; decrement bytes_left.
+        add r14, -4056;                   // paideia-as signed imm32 (see architecture.md §5)
+        jmp pfw_head;
+
+      pfw_ok:
+        xor rax, rax;                     // PO_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      pfw_err:
+        // pipe_forward_frame's rc is already in rax (either
+        // PO_ERR_BODY_TOO_LONG which is impossible here since we
+        // cap at 4056, or PO_ERR_SINK from a tty overflow). Propagate.
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
