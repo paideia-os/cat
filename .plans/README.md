@@ -15,6 +15,12 @@ Per-milestone implementation notes.
   files (LANDED).
 - `m3-003-notes.md` — FileReadRecord audit-first gate via
   AuditStub (LANDED).
+- `m4-001-notes.md` — multi-file order-preservation test (LANDED).
+- `m4-002-notes.md` — schema-typed passthrough against known-schema
+  fixture (LANDED).
+- `m4-003-notes.md` — large-file streaming test (>RAM, no OOM)
+  (LANDED).
+- `m4-004-notes.md` — stdin-piping test (LANDED).
 
 Upstream: `design/tooling/r49-r50-plan.md` §5.5 in the paideia-os
 repo.

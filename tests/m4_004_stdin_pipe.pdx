@@ -1,0 +1,238 @@
+// tests/m4_004_stdin_pipe.pdx — cat.M4-004
+// CatM4004 module: stdin-piping test (`a | cat | b` through the
+// shell pipeline).
+//
+// Purpose
+// -------
+// Prove that when `cat` is invoked with zero positional file
+// arguments, `cat_dispatch` takes the stdin path — reads bytes
+// via `StdinSource::stdin_read_chunk` (M2-stub; shell.M2 replaces
+// with `sys_ipc_recv`) and forwards them through
+// `Render::render_write_bytes` to the sink. In a real pipeline
+// (`a | cat | b`), the upstream `a` process' stdout endpoint
+// binds `cat`'s stdin, and `cat`'s stdout endpoint binds
+// downstream `b`'s stdin — the M2 stub replaces the endpoint pair
+// with a single-source seed buffer so the M4 harness can observe
+// the passthrough end-to-end without needing shell.M2 machinery
+// in place.
+//
+// This is the M2-004 correctness invariant (`design/tooling/
+// r49-r50-plan.md` §5.5).
+//
+// Fixture shape
+// -------------
+//   argv         = [ "cat"\0 ]        argc = 1     (zero positionals
+//                                                    → stdin path)
+//   Stdin seed:    "PIPED\n" = { 0x50, 0x49, 0x50, 0x45, 0x44, 0x0A }
+//                              (6 bytes)
+//
+// Assertions
+// ----------
+//   1. cat_dispatch(&argv, 1) returns CAT_EXIT_OK (0).
+//   2. TtySink::tty_out_len == 6.
+//   3. AuditStub::_audit_file_count == 0 — the stdin path has NO
+//      per-file audit (there is no file). A future
+//      StdinReadRecord / IPCReceiveRecord is a shell.M3 concern,
+//      not cat's. This assertion is load-bearing: a bug that
+//      moved the audit call outside the `pos_count > 0` branch
+//      into the top of dispatch would fail this check with
+//      `_audit_file_count == 1`.
+//   4. TtySink::tty_out_buf[0..6] byte-equals "PIPED\n" (proves
+//      end-to-end stdin → render → sink passthrough).
+//
+// Return codes from `test_cat_m4_004_stdin_pipe`
+// ----------------------------------------------
+//   0  — PASS
+//   1  — cat_dispatch returned non-zero exit code
+//   2  — tty_out_len != 6
+//   3  — audit count != 0 (stdin path incorrectly audited)
+//   4  — sink byte-sequence mismatch
+//
+// paideia-as compliance
+// ---------------------
+//   - Module basename `CatM4004` (PascalCase), no directory prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     6 for the sink-length check).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `test_cat_m4_004_stdin_pipe` is non-leaf: 5-push callee-
+//     save prologue lands rsp%16 == 0 at every nested call site.
+//   - `.bss` slot names prefixed `m4_004_` to sidestep cross-repo
+//     unqualified-name collisions.
+
+module CatM4004 = structure {
+
+  // ============================================================================
+  // Fixture .bss
+  // ============================================================================
+
+  // Stdin source bytes: "PIPED\n" (6 bytes). Padded to 8 for
+  // alignment of the next slot.
+  pub let mut m4_004_stdin_src : [u8; 8] = uninit @align(8)
+
+  // Expected sink bytes: "PIPED\n" (6 bytes).
+  pub let mut m4_004_expected : [u8; 8] = uninit @align(8)
+
+  // argv[0] = "cat\0".
+  pub let mut m4_004_argv0 : [u8; 8] = uninit @align(8)
+
+  // argv[1] pointer array (single entry: argv[0]).
+  pub let mut m4_004_argv : [u64; 1] = uninit @align(8)
+
+  // ============================================================================
+  // test_cat_m4_004_stdin_pipe() -> u64
+  //
+  // Signature: test_cat_m4_004_stdin_pipe : () -> u64 !{mem} @{}
+  //   RAX: 0 on PASS, distinct non-zero per assertion failure.
+  //
+  // Non-leaf; 5-push callee-save prologue.
+  // ============================================================================
+  pub let test_cat_m4_004_stdin_pipe : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M4-004 stdin-piping test. Populates the stdin source with 'PIPED\\n' = { 0x50, 0x49, 0x50, 0x45, 0x44, 0x0A } via 6 explicit byte-stores; populates the matching 6-byte expected buffer identically; populates argv[1] = { &'cat\\0' } (single entry, argc=1 → zero positionals → stdin path per cat_dispatch's `cmp r13, 0; je cd_stdin_path` branch at src/argv_dispatch.pdx:408). Resets stub tables; seeds the StdinSource stub via stdin_seed(stdin_src, 6). Calls cat_dispatch(argv, 1). Asserts: (1) exit == 0 (clean EOF from stdin_read_chunk's cursor==len path); (2) tty_out_len == 6 (all seeded bytes reached the sink; the render path with flags=0 takes the fast-path tty_write_bytes(rdi, rsi) at src/render.pdx:642 which is one call, not per-byte); (3) audit_stub_get_count == 0 — the stdin path does NOT call audit_stub_file_read (see the file-header note at src/argv_dispatch.pdx:59 'stdin path has no per-file audit — no file to record'); a bug that moved the audit call outside the pos_count > 0 branch would fail this assertion with 1 not 0; (4) sink bytes 0..6 byte-equal to expected 'PIPED\\n' via a scan loop that byte-loads sink + expected side-by-side (proves end-to-end stdin → render → sink passthrough — byte-order preservation, no truncation, no doubling). Distinct non-zero exit codes per assertion (1..4). 5-push callee-save prologue (rbx = sink base, r12 = expected base, r13 = scan cursor, r14 = expected byte, r15 = pad) lands rsp%16 == 0 at every nested call site. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (max 6).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ==============================================================
+        // Populate stdin source = "PIPED\n".
+        //   'P'=0x50, 'I'=0x49, 'P'=0x50, 'E'=0x45, 'D'=0x44, '\n'=0x0A
+        // ==============================================================
+        lea r11, [rip + m4_004_stdin_src];
+        mov rax, 0x50; mov_b [r11], rax;
+        lea r11, [rip + m4_004_stdin_src]; add r11, 1;
+        mov rax, 0x49; mov_b [r11], rax;
+        lea r11, [rip + m4_004_stdin_src]; add r11, 2;
+        mov rax, 0x50; mov_b [r11], rax;
+        lea r11, [rip + m4_004_stdin_src]; add r11, 3;
+        mov rax, 0x45; mov_b [r11], rax;
+        lea r11, [rip + m4_004_stdin_src]; add r11, 4;
+        mov rax, 0x44; mov_b [r11], rax;
+        lea r11, [rip + m4_004_stdin_src]; add r11, 5;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate expected sink bytes = "PIPED\n" (identical to stdin
+        // src since flags=0 takes the render fast-path which is a
+        // straight passthrough via tty_write_bytes).
+        // ==============================================================
+        lea r11, [rip + m4_004_expected];
+        mov rax, 0x50; mov_b [r11], rax;
+        lea r11, [rip + m4_004_expected]; add r11, 1;
+        mov rax, 0x49; mov_b [r11], rax;
+        lea r11, [rip + m4_004_expected]; add r11, 2;
+        mov rax, 0x50; mov_b [r11], rax;
+        lea r11, [rip + m4_004_expected]; add r11, 3;
+        mov rax, 0x45; mov_b [r11], rax;
+        lea r11, [rip + m4_004_expected]; add r11, 4;
+        mov rax, 0x44; mov_b [r11], rax;
+        lea r11, [rip + m4_004_expected]; add r11, 5;
+        mov rax, 0x0A; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv[0] = "cat\0".
+        // ==============================================================
+        lea r11, [rip + m4_004_argv0];
+        mov rax, 0x63; mov_b [r11], rax;
+        lea r11, [rip + m4_004_argv0]; add r11, 1;
+        mov rax, 0x61; mov_b [r11], rax;
+        lea r11, [rip + m4_004_argv0]; add r11, 2;
+        mov rax, 0x74; mov_b [r11], rax;
+        lea r11, [rip + m4_004_argv0]; add r11, 3;
+        xor rax, rax; mov_b [r11], rax;
+
+        // ==============================================================
+        // Populate argv pointer array (single entry).
+        // ==============================================================
+        lea r11, [rip + m4_004_argv];
+        lea rax, [rip + m4_004_argv0];
+        mov [r11 + 0*8], rax;
+
+        // ==============================================================
+        // Reset stub state.
+        // ==============================================================
+        call file_read_reset;
+        call stdin_reset;
+        call audit_stub_reset;
+        call file_schema_reset;
+
+        // ==============================================================
+        // Seed StdinSource with 6-byte source.
+        // ==============================================================
+        lea rdi, [rip + m4_004_stdin_src];
+        mov rsi, 6;
+        call stdin_seed;
+
+        // ==============================================================
+        // Dispatch.
+        // ==============================================================
+        lea rdi, [rip + m4_004_argv];
+        mov rsi, 1;
+        call cat_dispatch;
+        cmp rax, 0;
+        jne m4_004_fail_exit;
+
+        // Assertion 2: tty_out_len == 6.
+        lea r11, [rip + tty_out_len];
+        mov rax, [r11];
+        cmp rax, 6;
+        jne m4_004_fail_len;
+
+        // Assertion 3: audit count == 0 (stdin path has no audit).
+        call audit_stub_get_count;
+        cmp rax, 0;
+        jne m4_004_fail_audit;
+
+        // Assertion 4: byte scan.
+        lea rbx, [rip + tty_out_buf];
+        lea r12, [rip + m4_004_expected];
+        xor r13, r13;
+
+      m4_004_scan_head:
+        cmp r13, 6;
+        jge m4_004_pass;
+
+        lea r11, [rbx + r13*1];
+        xor rax, rax; mov_b rax, [r11];
+
+        lea r11, [r12 + r13*1];
+        xor r14, r14; mov_b r14, [r11];
+
+        cmp rax, r14;
+        jne m4_004_fail_bytes;
+
+        add r13, 1;
+        jmp m4_004_scan_head;
+
+      m4_004_pass:
+        xor rax, rax;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_004_fail_exit:
+        mov rax, 1;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_004_fail_len:
+        mov rax, 2;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_004_fail_audit:
+        mov rax, 3;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+
+      m4_004_fail_bytes:
+        mov rax, 4;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret
+      }
+    }
+}

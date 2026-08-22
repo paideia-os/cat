@@ -429,9 +429,53 @@ Every source file in this tree observes:
 
 ---
 
-## 7. M3 non-goals
+## 7. M4 correctness matrix
 
-The following are M4+ and are deliberately not in M3:
+M4 ships four `.pdx` test modules under `tests/` — one per M4
+issue in `design/tooling/r49-r50-plan.md` §5.5 — that exercise
+the M3 pipeline through the stubs already in the src tree. Each
+test module publishes exactly one entry function returning 0 on
+PASS and a distinct non-zero exit code per assertion failure so
+a driver harness can decode without inspecting logs.
+
+| Test | Module | Fixture | Focus | Fail codes |
+|------|--------|---------|-------|------------|
+| M4-001 | `CatM4001` | 3 seed files (A/B/C, 4 bytes each) + argv[4] | multi-file argv-order preservation | 1..4 |
+| M4-002 | `CatM4002` | 17-byte body + 32-byte 0xEE hash + argv=[cat, --schema, a] | R20b frame header + hash & body passthrough | 1..6 |
+| M4-003 | `CatM4003` | 131072-byte source (= 2 × CHUNK_MAX) | streaming loop iterates > once; working set bounded | 1..4 |
+| M4-004 | `CatM4004` | 6-byte stdin seed, argc=1 (zero positionals) | stdin path taken; audit NOT fired | 1..4 |
+
+Every test uses the harness pattern documented at §3.2: reset →
+seed → dispatch → assert on `TtySink::tty_out_buf` /
+`tty_out_len` / `_audit_file_count`. Since paideia-as has no
+data literals, every fixture byte / pointer is written at test
+entry via `mov_b [ptr], rax` (byte-scoped) or `mov [ptr], rax`
+(qword-scoped) after computing the address with `lea + add` —
+same idiom as `TtySink::tty_write_bytes`.
+
+**Load-bearing invariants covered by the matrix:**
+- Argv-order preservation (M4-001).
+- Audit-per-file count = argc-1 for the file path (M4-001).
+- Schema-declared branch routes to `PipeOut::pipe_forward_write`
+  and emits exactly one R20b frame with correct header +
+  hash-prefix + body (M4-002).
+- Schema branch also fires the audit-first gate (M4-002 asserts
+  `_audit_file_count == 1` under `--schema`).
+- Streaming loop iterates for source > `CHUNK_MAX`; working set
+  bounded by `fr_chunk_buf` + `tty_out_buf` = 128 KiB regardless
+  of source size (M4-003).
+- Sink overflow propagates as `CAT_EXIT_SYSTEM_ERROR` (M4-003).
+- Stdin path takes `pos_count == 0` branch and does NOT invoke
+  `audit_stub_file_read` — no `StdinReadRecord` at cat.M4 (a
+  future shell.M3 concern) (M4-004).
+- Fast-path render passthrough is byte-exact when `flags == 0`
+  (M4-004).
+
+---
+
+## 8. M4 non-goals
+
+The following are M5+ and are deliberately not in M4:
 
 - Real KIND_PDXFS_FILE(read) syscalls (blocked on R42 substrate).
 - Real KIND_TTY(write) syscalls (blocked on shell.M4 handoff).
@@ -439,26 +483,28 @@ The following are M4+ and are deliberately not in M3:
   pipeline mint).
 - Real libpdx-semantic-pipe `Passthrough::pipe_forward` /
   `Send::send_frame` binding (blocked on libpdx-semantic-pipe.M2
-  + downstream KIND_IPC_ENDPOINT). M3's `PipeOut::pipe_forward_*`
-  routes frames through TtySink so the wire bytes remain
-  observable to the M4 harness.
+  + downstream KIND_IPC_ENDPOINT). The stubbed
+  `PipeOut::pipe_forward_*` still routes frames through TtySink
+  so the wire bytes remain observable to the M4 matrix.
 - Real libpdx-audit `audit_begin` + `audit_record_output` +
   `audit_commit` binding (blocked on the `svc.audit-journal`
-  broker cap, a shell.M2 concern). M3's `AuditStub` collapses the
-  three-call sequence into one atomic
+  broker cap, a shell.M2 concern). `AuditStub` still collapses
+  the three-call sequence into one atomic
   `audit_stub_file_read(path_ptr)` call.
 - Real R42 `.pdxfs` schema-metadata lookup
   (`sys_pdxfs_getxattr(handle, "pdxfs.schema", ...)` or inline
-  cap-descriptor field). M3's `FileSchema` per-handle table is
-  test-seedable via `file_schema_seed`.
-- v1.0 RawByteChunk@0.1 canonical schema-hash fingerprint. M3
-  ships the placeholder pattern (0x1111... / 0x2222... /
-  0x3333... / 0x4444...); v1.0 recomputes from the canonical
-  schema DDL — consumers keyed off the M3 value must re-key at
-  release time (tracked at cat.M5).
+  cap-descriptor field). `FileSchema` per-handle table is still
+  test-seedable via `file_schema_seed` — M4-002 exercises this
+  path.
+- v1.0 RawByteChunk@0.1 canonical schema-hash fingerprint. The
+  placeholder pattern (0x1111... / 0x2222... / 0x3333... /
+  0x4444...) still ships in `rbc_reset`; v1.0 recomputes from the
+  canonical schema DDL (tracked at cat.M5).
 - Migration to libpdx-argv (unblocked by libpdx-argv M2-001;
-  scheduled at cat.M3 in plan §5.5, but deferred pending a
-  cross-repo pass on the argv shape).
-- Correctness matrix + smoke fixtures + pre-release fuzzers
-  (M4-001 through M4-004).
-- Signed release + `.pdxdoc` (M5-001).
+  deferred pending a cross-repo pass on the argv shape).
+- QEMU smoke harness that invokes the four `test_cat_m4_*` entry
+  points from a bootable image (blocked on shell.M4 + the
+  eventual paideia-os test driver; the M4 matrix itself is
+  runnable today via any harness that can link the cat object
+  files and call each test entry).
+- Signed release + `.pdxdoc` + mirror push (M5-001, M5-002).
