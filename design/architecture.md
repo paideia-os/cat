@@ -23,11 +23,12 @@ surface is:
   argv-order and writes its bytes to stdout. `cat --help` and
   `cat --version` follow the D3 standard flag vocabulary in
   `design/tooling/plan.md` I3. `cat` with zero positional files
-  reads from stdin (KIND_IPC_ENDPOINT) — this path lands at
-  M2-004.
+  reads from stdin (KIND_IPC_ENDPOINT) — this path is exercised
+  at M2-004.
 - **stdout (text):** file bytes going verbatim to KIND_TTY(write);
-  at M2 `-n` prefixes each line with its 1-based number and `-A`
-  renders non-printable bytes with printable escapes.
+  `-n` prefixes each output line with its right-justified 6-column
+  line number followed by a tab; `-A` renders non-printable bytes
+  with `^X` / `M-` / `$\n` escapes matching GNU cat -A = -vET.
 - **stdout (schema):** if the file's `.pdxfs` metadata declares a
   schema, `cat` streams that schema's records on the semantic-pipe
   layer (M3-001). If no schema is declared, `cat` emits
@@ -35,56 +36,77 @@ surface is:
   (M3-002). Both schemas are declared in `caps.decl` at M1 so
   consumers can inspect the manifest early.
 - **stderr:** diagnostics (unreadable file, cap denied, sink
-  overflow at M1).
+  overflow).
 - **exit codes** (per I4 in `design/tooling/plan.md` §4.2):
   - 0 — every file read and rendered successfully.
   - 2 — usage error (missing file, unknown flag, name too long).
-  - 3 — system error (audit journal unreachable at M3+, render sink
-    overflow at M1, file-read I/O error at M2+).
+  - 3 — system error (audit journal unreachable at M3+, render
+    sink overflow, file-read I/O error at R42+).
   - 4 — cap denied (no read cap for a named file's path).
 
-Internally the binary is three modules at M1:
+Internally the binary is five modules at M2:
 
-- `CatDispatch` (`src/argv_dispatch.pdx`) — argv parsing at M1
-  (inline byte-scan; M2 migrates to `libpdx-argv` once its
-  flag-arity API can express "-n and -A are boolean, do not
-  consume argv[i+1]"). The parser stores parsed flag bits and up
-  to `POS_MAX = 8` positional file pointers in the module's `.bss`
-  singleton. Also carries the top-level dispatcher `cat_dispatch`
-  and the alt entry `cat_dispatch_from_buf(buf, len)` used by
-  tests and by the smoke fixture that predates R42 substrate.
-- `FileRead` (`src/file_read.pdx`) — a file read stub. At M1
-  returns `(0, 0)` unconditionally (file not found) because the
-  R42 substrate (`KIND_PDXFS_FILE`) has not landed in the kernel
-  at HEAD (2026-08-21) per `r49-r50-plan.md` §2.4. The return
-  contract is `rax = src_buf_ptr` (0 = not found; non-zero at M2 =
-  bytes read into a caller-visible buffer) with a `.bss` companion
-  `file_src_len` carrying the byte-count. M2 replaces the body
-  with a `KIND_PDXFS_FILE(read)` syscall wrapped by libpdx-cap;
-  the return contract is preserved so the M2 patch is a
-  body-only edit inside `file_read_stub`.
+- `CatDispatch` (`src/argv_dispatch.pdx`) — argv parsing at M2
+  (inline byte-scan; M3 migrates to `libpdx-argv` now that
+  M2-001's FKIND_UNKNOWN=boolean fix removes the M1 blocker).
+  The parser stores parsed flag bits and up to `POS_MAX = 8`
+  positional file pointers in the module's `.bss` singleton.
+  Also carries the top-level dispatcher `cat_dispatch` and the
+  alt entry `cat_dispatch_from_buf(buf, len)` used by tests and
+  by the smoke fixture that predates R42 substrate.
+- `FileRead` (`src/file_read.pdx`) — streaming source layer:
+  `file_open(path)` → handle; `file_read_chunk(handle, dst, cap)`
+  → bytes read (≤ CHUNK_MAX = 65536); `file_close(handle)`. At
+  M2 the bodies are a test-seedable stub (`file_read_seed_push`
+  pre-loads canned sources; `file_open` draws handles in FIFO
+  order; the seed cursor advances per read) because the R42
+  substrate (`KIND_PDXFS_FILE`) has not landed in the kernel at
+  HEAD per `r49-r50-plan.md` §2.4. Owns the shared 64 KiB
+  `fr_chunk_buf` scratch used as the destination for both file
+  and stdin reads. R42 replaces the bodies with `sys_pdxfs_open`
+  / `sys_pdxfs_read` / `sys_pdxfs_close` wrappers via libpdx-cap
+  and deletes the seed table; the four function signatures are
+  invariant across the M2→R42 migration.
+- `StdinSource` (`src/stdin_source.pdx`) — streaming stdin layer:
+  `stdin_read_chunk(dst, cap)` → bytes read (0 = EOF). At M2 the
+  body is a test-seedable stub (`stdin_seed(buf, len)` pushes a
+  single source; the cursor advances per read) because the
+  shell.M2 pipeline mint of the KIND_IPC_ENDPOINT frame carrier
+  has not landed per `r49-r50-plan.md` §5.2. shell.M2 replaces
+  the body with a `sys_ipc_recv` wrapper via libpdx-cap; the
+  function signatures are invariant.
+- `Render` (`src/render.pdx`) — the `-n` / `-A` transformation
+  layer: `render_reset(flags)` initialises state (line counter =
+  1, at-line-start = 1, flags stashed); `render_write_bytes(src,
+  len)` iterates the source range byte-by-byte, emitting through
+  `TtySink::tty_write_byte` with prefix (line number + tab) at
+  each new line start when `-n` is set, and escape substitution
+  when `-A` is set. Fast-path when neither flag is set: single
+  `tty_write_bytes(rdi, rsi)` call — no per-byte overhead.
 - `TtySink` (`src/tty_sink.pdx`) — a bounded write sink standing
   in for the M2 `KIND_TTY(write)` syscall. Backing store is a
-  4 KiB `.bss` scratch buffer with a cursor; the byte count
+  64 KiB `.bss` scratch buffer with a cursor; the byte count
   reached is exposed via `tty_out_len` for the M4 test harness.
-  M2 replaces the sink with a real `KIND_TTY(write)` handoff via
-  the shell's exec-time cap propagation; the sink's field names
-  do not change, so the M2 patch is a leaf-function body edit.
+  shell.M4 replaces the sink with a real `KIND_TTY(write)` handoff
+  via the shell's exec-time cap propagation; the sink's field
+  names do not change, so the shell.M4 patch is a leaf-function
+  body edit inside `tty_write_bytes` + `tty_write_byte`. M2
+  widens the cap from M1's 4 KiB to 64 KiB so the streaming path
+  + render inflation can be exercised end-to-end.
 
-The M1 sink exists so the alt entry `cat_dispatch_from_buf(buf,
-buf_len)` can be exercised end-to-end from a test fixture without
-depending on shell.M4's KIND_TTY handoff or on R42's
-KIND_PDXFS_FILE substrate — both blockers today per
-`r49-r50-plan.md` §2.4.
+The alt entry `cat_dispatch_from_buf(buf, buf_len)` bypasses
+argv + file read + render — driving `TtySink::tty_write_bytes`
+directly. It remains the simplest end-to-end fixture, useful for
+smoke-checking the M2 sink cap.
 
 ---
 
-## 2. Argv grammar (M1-002)
+## 2. Argv grammar (M1-002; preserved verbatim through M2)
 
-The M1 grammar accepts:
+The grammar accepts:
 
 ```
-argv     = argv[0] flag* positional+
+argv     = argv[0] flag* positional*
 flag     = "-n"                 # M2: prefix each line with its 1-based number
          | "-A"                 # M2: render non-printables with escapes
          | "--schema"           # M3: emit schema records on stdout
@@ -93,77 +115,140 @@ positional = <NUL-terminated bytes>    # a file path; max POS_MAX per invocation
 
 Flags are boolean (arity 0). Any short flag with more than one
 letter (e.g. `-nA`) is rejected as usage error 2 per the D3
-one-per-hyphen contract (`design/tooling/plan.md` §3.4). Any long
-flag not in the whitelist above is rejected as usage error 2.
-Positionals are collected in argv-order into `pos_ptrs`. Zero
-positionals is *valid* (stdin passthrough at M2-004); at M1 the
-dispatcher treats zero positionals as usage error 2 until M2-004
-lands the stdin path.
+one-per-hyphen contract. Any long flag not in the whitelist is
+rejected as usage error 2. Positionals are collected in
+argv-order into `pos_ptrs`. **Zero positionals is valid** — the
+M2-004 stdin path reads from `StdinSource::stdin_read_chunk`
+until EOF.
 
-The M1 grammar limits are:
+Grammar limits:
 - `POS_MAX = 8` — the maximum number of file arguments per
-  invocation. Exceeding this returns exit 2 (usage error). M2
-  removes this cap as part of the streaming-read work.
+  invocation. Exceeding this returns exit 2. Matches
+  `FileRead::SEED_MAX` so the M4 test harness can pre-seed
+  one source per positional.
 - Flags are stored as a bit mask (`FLAG_N = 0x1`, `FLAG_A = 0x2`,
-  `FLAG_SCHEMA = 0x4`). Storage is a single u64 in `.bss`; M4
-  migrates to a caller-owned struct.
+  `FLAG_SCHEMA = 0x4`). Storage is a single u64 in `.bss`.
 
-Migration to `libpdx-argv` (deferred to M2). libpdx-argv M1-002's
-short-flag parser consumes `argv[i+1]` as a value if it does not
-start with '-'. `cat -n foo.txt` under that semantics binds
-`foo.txt` to `-n` as a value and leaves `pos_count == 0`, which
-would be a user-facing bug. Migration waits for libpdx-argv M2's
-declarative "these flags are boolean" API. The inline parser is
-byte-for-byte compatible with what libpdx-argv-M2 will produce
-(same `pos_ptrs` shape, same flag bit mask, same error codes) so
-the M2 migration is a call-site swap, not a data-shape rewrite.
+Migration to `libpdx-argv`: **now unblocked** by libpdx-argv
+M2-001 (`FlagSpec::lookup` returns `FKIND_UNKNOWN = 0xFF` on
+miss; the parser treats it identically to `FKIND_BOOL` so
+`cat -n foo.txt` no longer binds `foo.txt` as `-n`'s value).
+Migration is scheduled at cat.M3 per `r49-r50-plan.md` §5.5 so
+the M2 wave stays byte-compatible with the M1 golden fixtures.
+The inline parser is byte-for-byte compatible with what
+libpdx-argv M2 produces (same `pos_ptrs` shape, same flag bit
+mask, same error codes) so the M3 migration is a call-site
+swap, not a data-shape rewrite.
 
 ---
 
-## 3. Dispatch pipeline
+## 3. Dispatch pipeline (M2)
 
 `cat_dispatch(argv, argc)` runs the following sequence:
 
-1. `cat_reset()` — zero the parsed-state `.bss` slots.
-2. `cat_parse_argv(argv, argc)` — walk argv; store flag bits into
-   `flag_mask`; store positional file ptrs into `pos_ptrs`. On
-   parse error, return exit 2.
-3. If `pos_count == 0`, return exit 2 (usage error; M2-004 replaces
-   this arm with the stdin passthrough).
-4. For each positional file (M1: only the first is read; M2-001
-   iterates all in argv-order): call `file_read_stub()`. At M1 the
-   stub always returns `(0, 0)` → return exit 4 (cap denied).
-5. If `file_read_stub()` returned a non-zero buffer pointer (M2+),
-   call `tty_write_bytes(src_ptr, src_len)`. On sink overflow,
-   return exit 3.
-6. Return exit 0.
+1. `cat_reset()` — zero parser state.
+2. `cat_parse_argv(argv, argc)` — populate `flag_mask`,
+   `pos_ptrs`, `pos_count`. On parse error, return exit 2.
+3. `tty_reset()` — zero the sink cursor.
+4. `render_reset(flag_mask)` — save flags, init line counter to
+   1, mark at-line-start. Runs ONCE — line numbering is
+   continuous across concatenated files (POSIX cat -n semantics).
+5. Branch on `pos_count`:
+   - `pos_count == 0` → **stdin path** (M2-004):
+     ```
+     loop:
+       bytes = stdin_read_chunk(fr_chunk_buf, CHUNK_MAX)  # 65536
+       if bytes == 0: break                                # EOF
+       render_write_bytes(fr_chunk_buf, bytes) → check sink OK
+     ```
+   - `pos_count > 0` → **multi-file path** (M2-001):
+     ```
+     for i in 0..pos_count:
+       handle = file_open(pos_ptrs[i])
+       if handle == 0: return exit 4                       # cap denied / not found
+       loop:
+         bytes = file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
+         if bytes == 0: break                              # EOF this file
+         render_write_bytes(fr_chunk_buf, bytes) → check sink OK
+       file_close(handle)
+     ```
+6. Return exit 0 on clean completion; exit 3 on any sink overflow.
 
 The alt entry `cat_dispatch_from_buf(buf, buf_len)` skips steps
-1–4 and drives step 5 directly. It is used by M4 tests + the M1
-smoke fixture (`cat_dispatch_from_buf` is the earliest end-to-end
-runnable in this tree — it demonstrates the buf → sink pipeline
-without needing R42 or shell.M4).
+1–5 and drives `tty_write_bytes` directly, bypassing the render
+layer.
+
+### 3.1 Streaming discipline
+
+The 64 KiB `FileRead::fr_chunk_buf` scratch is the ONLY per-file
+working memory the pipeline holds — a 1 GiB file streams through
+16384 chunks; RAM never holds more than one chunk. This satisfies
+r49-r50-plan.md §5.5 M2-003 ("never buffer full file; 64KiB
+chunk"). The buffer is shared between the file and stdin sources
+because M2 is not re-entrant: `cat_dispatch` drives sources
+sequentially.
+
+### 3.2 Test seedability
+
+`cat_dispatch` does NOT call `file_read_reset` / `stdin_reset`
+itself — those clear the M2 seed table which the M4 test harness
+populates BEFORE dispatch. The harness pattern is:
+
+```
+file_read_reset()                          # or stdin_reset()
+file_read_seed_push(a_buf, a_len)          # or stdin_seed(a_buf, a_len)
+file_read_seed_push(b_buf, b_len)
+...
+cat_dispatch(argv, argc)                   # argv[1..] paths are ignored by the
+                                           #   stub; the seed order maps 1-to-1
+                                           #   onto the argv positional order.
+```
+
+Real R42 replaces the seed tables with `sys_pdxfs_open` /
+`sys_ipc_recv` and deletes the M2 seed helpers; `cat_dispatch`'s
+own control flow is invariant across the migration.
 
 ---
 
 ## 4. Storage model
 
-All M1 state is `.bss`-singleton (one dispatch per process). The
-`.bss` slots owned by the three modules are:
+All M2 state is `.bss`-singleton (one dispatch per process). The
+`.bss` slots owned by the five modules are:
 
-- `CatDispatch.flag_mask : u64` — the parsed flag bit mask.
+- `CatDispatch.flag_mask : u64` — parsed flag bit mask.
 - `CatDispatch.pos_ptrs  : [u64; 8]` — positional file ptrs.
 - `CatDispatch.pos_count : u64` — number of positional entries.
 - `CatDispatch.parse_error_arg_index : u64` — offending argv
-  index on parse error (M4 diagnostic renderer).
-- `FileRead.file_src_len : u64` — bytes returned by the M1 stub
-  (always 0; M2 = real byte count).
-- `TtySink.tty_out_buf : [u8; 4096]` — the sink scratch buffer.
-- `TtySink.tty_out_len : u64` — the sink cursor / bytes-written
+  index on parse error.
+- `FileRead.fr_chunk_buf : [u8; 65536]` — shared streaming
+  staging buffer (both file and stdin reads).
+- `FileRead.fr_seed_bufs : [u64; 9]` — M2 seed table (bufs). Slot
+  0 unused (invalid-handle sentinel).
+- `FileRead.fr_seed_lens : [u64; 9]` — M2 seed table (lens).
+- `FileRead.fr_seed_cursors : [u64; 9]` — per-handle read cursors.
+- `FileRead.fr_seed_count : u64` — number of seeds pushed
+  (0..SEED_MAX = 8).
+- `FileRead.fr_next_handle : u64` — last handle issued by
+  `file_open` (0..SEED_MAX).
+- `StdinSource.sr_stdin_buf / sr_stdin_len / sr_stdin_cursor :
+  u64` — single-source triple for the M2 stdin stub.
+- `Render.render_flags : u64` — snapshot of flag_mask passed to
+  render_reset.
+- `Render.render_line_num : u64` — line counter (starts at 1).
+- `Render.render_at_line_start : u64` — 0/1 flag: 1 = next
+  non-EOF byte begins a new line and needs a prefix (when -n).
+- `TtySink.tty_out_buf : [u8; 65536]` — sink scratch (M2 widened
+  from M1's 4 KiB).
+- `TtySink.tty_out_len : u64` — sink cursor / bytes-written
   running count.
 
-M4 will migrate these to caller-owned structures once the
-call-graph is stable.
+`.bss` slot names in modules other than TtySink and CatDispatch
+carry a module-scoped prefix (`fr_`, `sr_`, `render_`) to avoid
+cross-repo unqualified-symbol collisions (mirrors the R48 vello↔
+vrr `vrc_→vrenc_` rename policy in paideia-os).
+
+M4 migrates these to caller-owned structures once the call-graph
+is stable.
 
 ---
 
@@ -174,8 +259,9 @@ Every source file in this tree observes:
 - Module name PascalCase basename, no directory prefix (per
   `feedback_paideia_os_loop_shape`).
 - No `test` mnemonic; every zero-check is `cmp reg, 0`.
-- Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (M1's largest
-  are 8 for POS_MAX and 4096 for the sink cap).
+- Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (M2's
+  largest: 65536 for CHUNK_MAX / TTY_OUT_CAP; 100000 for the
+  Render `10^5` digit-place).
 - `r11` is scratch (paideia-as reserved); reloaded before every
   `.bss` read/write.
 - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248
@@ -186,45 +272,53 @@ Every source file in this tree observes:
 - Instruction vocabulary stays inside the R49 reference-
   implementation subset: `add`, `and`, `or`, `xor`, `shl`, `shr`,
   `mov`, `mov_b`, `cmp`, `lea`, `call`, `ret`, `push`, `pop`,
-  `jmp`, `je`, `jne`, `jge`, `jg`, `jl`, `jle`. No `sub` on
-  general registers (the pkg main uses `sub rsp, 8` for stack-pad
-  alignment which is a distinct case); no `not`, `neg`, `dec`,
-  `inc`.
+  `jmp`, `je`, `jne`, `jge`, `jg`, `jl`, `jle`. **M2 addition:**
+  `add reg, imm` with a NEGATIVE imm (e.g. `add rax, -100000`)
+  is used in the Render layer for digit extraction — this encodes
+  as `add reg64, imm8/imm32` with a sign-extended immediate,
+  which paideia-as supports via `add_reg64_imm8` /
+  `add_reg64_imm32` (see the encoder tests
+  `add_reg64_imm8_negative_value` +
+  `add_reg64_imm32_fitting_value`). The `sub` mnemonic is still
+  avoided to stay byte-compatible with the M1 style ban.
 
 ---
 
 ## 6. Cross-repo dependencies
 
 - **paideia-os kernel:** `KIND_USER` (0x190, R48.M1), `KIND_TTY`
-  (existing), `KIND_PDXFS_FILE` (R42, TBD — blocker), `KIND_IPC_
-  ENDPOINT` (base 5, R20b). The R42 substrate is filed as
-  paideia-os R42-PREP-001 through R42-PREP-003 per
-  `r49-r50-plan.md` §5.0. Blocks cat.M1-003's real KIND_TTY sink
-  and cat.M2's real KIND_PDXFS_FILE(read).
-- **shell (paideia-os/shell):** cat.M1-003 declares the shell.M4
-  KIND_TTY handoff dependency but stands in with the M1 sink
-  until shell.M4 lands.
-- **libpdx-argv (paideia-os/libpdx-argv):** cat.M2 migrates to
-  libpdx-argv once its declarative flag-arity API lands (see §2).
+  (existing), `KIND_PDXFS_FILE` (R42, TBD — blocker for
+  file_read.pdx's real body), `KIND_IPC_ENDPOINT` (base 5,
+  R20b — blocker for stdin_source.pdx's real body). The R42
+  substrate is filed as paideia-os R42-PREP-001 through
+  R42-PREP-003 per `r49-r50-plan.md` §5.0.
+- **shell (paideia-os/shell):** shell.M4 KIND_TTY handoff still
+  blocks the real TtySink; shell.M2 pipeline mint of
+  KIND_IPC_ENDPOINT still blocks the real stdin path. cat M2
+  stands in with test-seedable stubs; shell.M4 and shell.M2
+  landings will replace the two stub bodies.
+- **libpdx-argv (paideia-os/libpdx-argv):** libpdx-argv M2-001
+  landed the FKIND_UNKNOWN=boolean fix that unblocks cat's
+  migration. Migration scheduled at cat.M3.
 - **libpdx-semantic-pipe:** cat.M3-001 depends on
-  libpdx-semantic-pipe.M2 (schema-typed passthrough).
+  libpdx-semantic-pipe.M2 (schema-typed passthrough via
+  `Passthrough::pipe_forward`).
 - **libpdx-audit:** cat.M3-003 depends on libpdx-audit.M2
   (FileReadRecord per file before first byte).
 
 ---
 
-## 7. M1 non-goals
+## 7. M2 non-goals
 
-The following are M2+ and are deliberately not in M1:
+The following are M3+ and are deliberately not in M2:
 
 - Real KIND_PDXFS_FILE(read) syscalls (blocked on R42 substrate).
 - Real KIND_TTY(write) syscalls (blocked on shell.M4 handoff).
-- Multi-file concatenation (M2-001 — M1 stops at the first file).
-- `-n` line-number rendering (M2-002).
-- `-A` non-printable rendering (M2-002).
-- Streaming reads with 64 KiB chunks (M2-003).
-- Stdin passthrough (M2-004).
-- Schema-typed passthrough (M3-001).
-- RawByteChunk[] emission (M3-002).
-- FileReadRecord audit (M3-003).
+- Real KIND_IPC_ENDPOINT stdin frames (blocked on shell.M2).
+- Migration to libpdx-argv (unblocked by libpdx-argv M2-001;
+  scheduled at cat.M3 for byte-compat with M1 fixtures).
+- Schema-typed passthrough via `Passthrough::pipe_forward`
+  (M3-001).
+- RawByteChunk[] emission for schemaless files (M3-002).
+- FileReadRecord audit via libpdx-audit (M3-003).
 - Signed release + `.pdxdoc` (M5-001).

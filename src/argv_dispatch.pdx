@@ -1,53 +1,74 @@
-// src/argv_dispatch.pdx — cat.M1-001 (skeleton) → cat.M1-002 (argv
-//                          surface) → cat.M1-003 (first runnable)
-// CatDispatch module: argv → parsed flags + positional list → file
-// read stub → TtySink → exit code.
+// src/argv_dispatch.pdx — cat.M1-001..M1-003 (skeleton) → cat.M2-001..M2-004
+// CatDispatch module: argv → parsed flags + positional list → per-
+// file streaming read → render (-n / -A) → TtySink; OR stdin read
+// → render → TtySink when argv has zero positionals.
 //
-// M1-003 wires the pipeline end-to-end for the first time:
-//   * Removes the inline `file_read_stub` definition (M1-001 /
-//     M1-002 kept it here so the scaffold compiled standalone);
-//     the symbol is now re-hosted in `src/file_read.pdx` as
-//     `FileRead::file_read_stub`. The call site in
-//     `cat_dispatch` is unchanged.
-//   * Adds the `tty_reset` + `tty_write_bytes` calls in the
-//     `file_read_stub` non-zero fall-through arm (unreachable at
-//     M1 because the stub always returns 0; the wiring exists so
-//     M2's real KIND_PDXFS_FILE(read) is a body-only edit inside
-//     `file_read.pdx`).
-//   * Adds the alt entry `cat_dispatch_from_buf(buf, buf_len)`
-//     which skips argv + file read and drives `tty_reset` +
-//     `tty_write_bytes` directly. This is the earliest end-to-end
-//     runnable in the tree — it demonstrates the buf → sink
-//     pipeline without needing R42 substrate or shell.M4.
+// M2 pipeline (replaces the M1 single-file / stubbed-read shape)
+// --------------------------------------------------------------
+//   1. `cat_reset` — zero parser state.
+//   2. `cat_parse_argv` — populate `flag_mask`, `pos_ptrs`,
+//      `pos_count`. Parse error collapses to CAT_EXIT_USAGE_ERROR.
+//   3. `tty_reset` — zero sink cursor.
+//   4. `render_reset(flag_mask)` — save flags, init line counter
+//      to 1, mark at-line-start. Continuity of line numbering
+//      across concatenated files is preserved because reset runs
+//      once BEFORE the per-file loop.
+//   5. Branch on pos_count:
+//        - pos_count == 0 → stdin path (M2-004): loop
+//          `stdin_read_chunk(fr_chunk_buf, CHUNK_MAX)` →
+//          `render_write_bytes(fr_chunk_buf, bytes)` until EOF
+//          (0-byte read).
+//        - pos_count > 0 → multi-file path (M2-001): for each
+//          `pos_ptrs[i]` in argv-order, `file_open` (0 → exit 4),
+//          then loop `file_read_chunk(handle, fr_chunk_buf,
+//          CHUNK_MAX)` → `render_write_bytes(fr_chunk_buf,
+//          bytes)` until EOF, then `file_close(handle)`.
+//   6. Return CAT_EXIT_OK / CAT_EXIT_SYSTEM_ERROR (any sink
+//      overflow) / CAT_EXIT_CAP_DENIED (any file_open miss).
 //
-// The M1-003 edit is additive against the M1-002 file: the
-// `cat_dispatch` epilogue's exit-code arms are unchanged and the
-// argv parser is untouched.
+// Streaming discipline (M2-003)
+// -----------------------------
+// The per-source read loop uses `FileRead::fr_chunk_buf` — a
+// 64 KiB `.bss` scratch buffer — as the staging area. Both
+// `file_read_chunk` and `stdin_read_chunk` cap their per-call byte
+// count at CHUNK_MAX = 65536 so the working set is bounded at 64
+// KiB independent of file size. A 1 GiB file is streamed through
+// 16384 chunks; RAM never holds more than one chunk.
+//
+// Test seedability (M4 sets up state before dispatch)
+// ---------------------------------------------------
+// `cat_dispatch` does NOT call `file_read_reset` / `stdin_reset`
+// itself — those clear the M2 seed table which the M4 test harness
+// populates BEFORE dispatch (via `file_read_seed_push` and
+// `stdin_seed`). This lets a test seed once, dispatch, and inspect
+// `TtySink::tty_out_buf`. Real R42 replaces the seed table with
+// `sys_pdxfs_open` / `sys_ipc_recv` and the M2 seed helpers are
+// deleted; `cat_dispatch`'s own control flow does not change.
 //
 // Exit-code discipline (per I4 in design/tooling/plan.md §4.2):
-//   0 — read + wrote successfully
-//   2 — usage error (parse error, missing file, name too long,
-//        positional overflow)
-//   3 — system error (sink overflow at M1; file-read I/O at M2+)
-//   4 — cap denied / file not found (stubbed until M2)
+//   0 — every file read and rendered successfully
+//   2 — usage error (parse error, positional overflow)
+//   3 — system error (render sink overflow, propagated from
+//        tty_write_byte / tty_write_bytes; R42 will add file-read
+//        I/O errors on the same code)
+//   4 — cap denied / file not found (file_open miss)
 //
 // paideia-as compliance
 // ---------------------
 //   - Module name PascalCase basename (`CatDispatch`), no directory
 //     prefix.
 //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (M1 largest:
-//     236 for NAME_MAX_LEN, 8 for POS_MAX, plus per-byte ASCII).
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (M2's
+//     largest: 65536 for CHUNK_MAX / TTY_OUT_CAP; 236 for
+//     NAME_MAX_LEN in the argv parser body).
 //   - r11 scratch (paideia-as reserved); reloaded before every
-//     .bss read/write.
-//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248
-//     mitigation).
-//   - SysV push/pop parity preserved in every non-leaf function.
+//     `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - SysV push/pop parity: `cat_dispatch` uses a 5-push callee-
+//     save prologue (rbx / r12 / r13 / r14 / r15) — rsp%16 == 0
+//     at every nested call site.
 //   - Instruction vocabulary stays inside the R49 reference-
-//     implementation subset (add / and / or / xor / shl / shr /
-//     mov / mov_b / cmp / lea / call / ret / push / pop / jmp /
-//     je / jne / jge / jg / jl / jle). No `sub` on general regs,
-//     no `not`, `neg`, `dec`, `inc`.
+//     implementation subset (see design/architecture.md §5).
 
 module CatDispatch = structure {
 
@@ -71,44 +92,24 @@ module CatDispatch = structure {
   pub let PARSE_ERR_NAME_TOO_LONG           : u64 = 5
 
   // ============================================================================
-  // Flag bit mask constants
+  // Flag bit mask constants (mirror Render::RENDER_FLAG_*)
   // ============================================================================
-  pub let FLAG_N       : u64 = 0x1   // -n      (line numbering — M2)
-  pub let FLAG_A       : u64 = 0x2   // -A      (non-printable render — M2)
-  pub let FLAG_SCHEMA  : u64 = 0x4   // --schema (schema records — M3)
+  pub let FLAG_N       : u64 = 0x1   // -n      line numbering (M2-002)
+  pub let FLAG_A       : u64 = 0x2   // -A      non-printable render (M2-002)
+  pub let FLAG_SCHEMA  : u64 = 0x4   // --schema schema records (M3)
 
   // ============================================================================
   // Argv-parse limits
   // ============================================================================
-
-  // Max length of a positional file name (bytes, excluding NUL).
-  // Shared upper bound with the doc reader; the true KIND_PDXFS_FILE
-  // path bound at R42 substrate is 4 KiB, but M1 keeps 236 across
-  // the R49/R50 tools so the hand-audit surface stays small.
   pub let NAME_MAX_LEN : u64 = 236
-
-  // Max number of positional file arguments per invocation. 8 is the
-  // M1 ceiling; M2-003's streaming-read work removes the cap.
-  pub let POS_MAX : u64 = 8
+  pub let POS_MAX      : u64 = 8
 
   // ============================================================================
   // Singleton .bss (bootstrap-scope; M4 migrates to caller-owned)
   // ============================================================================
-
-  // Parsed flag bit mask (see FLAG_* above). 0 after cat_reset.
   pub let mut flag_mask : u64 = uninit @align(8)
-
-  // Positional file pointers (interior into caller-owned argv memory).
-  // Only entries [0 .. pos_count) are meaningful.
   pub let mut pos_ptrs : [u64; 8] = uninit @align(8)
-
-  // Number of positional entries stored in pos_ptrs. 0 after
-  // cat_reset; incremented by cat_parse_argv on each positional.
   pub let mut pos_count : u64 = uninit @align(8)
-
-  // Offending argv index on parse error. 0 after cat_reset; set by
-  // cat_parse_argv to the index of the argv entry that failed the
-  // grammar check. Consumed by the M4 diagnostic renderer.
   pub let mut parse_error_arg_index : u64 = uninit @align(8)
 
   // ============================================================================
@@ -116,16 +117,13 @@ module CatDispatch = structure {
   //
   // Signature: cat_reset : () -> () !{mem} @{}
   //
-  // Zero flag_mask, pos_count, parse_error_arg_index. pos_ptrs
-  // entries past pos_count are unreachable so no zeroing is needed
-  // there.
-  //
-  // Leaf function; r11 scratch; no push/pop parity to preserve.
+  // Zero flag_mask, pos_count, parse_error_arg_index. Leaf; r11
+  // scratch; no push/pop parity.
   // ============================================================================
   pub let cat_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-002 cat_reset. Zero flag_mask, pos_count, parse_error_arg_index so a subsequent cat_parse_argv starts from a known baseline. Mirror of doc's render_reset shape. Leaf function; r11 scratch used only for the .bss lea; no callee-save touched.",
+      justification: "cat.M1-002 cat_reset. Zero flag_mask, pos_count, parse_error_arg_index so a subsequent cat_parse_argv starts from a known baseline. Leaf function; r11 scratch used only for the .bss lea; no callee-save touched.",
       block: {
         xor rax, rax;
         lea r11, [rip + flag_mask];              mov [r11], rax;
@@ -141,55 +139,31 @@ module CatDispatch = structure {
   // Signature: cat_parse_argv : (u64, u64) -> u64 !{mem} @{}
   //   RDI: argv (u64* — array of NUL-terminated arg pointers)
   //   RSI: argc (count of entries in argv)
-  //   RAX: PARSE_OK (0) on success, else one of the PARSE_ERR_*
-  //        codes above. On error, parse_error_arg_index is also
-  //        set to the offending argv index.
+  //   RAX: PARSE_OK on success, else one of the PARSE_ERR_* codes.
+  //        On error, parse_error_arg_index is set to the offending
+  //        argv index.
   //
-  // Grammar (see design/architecture.md §2):
-  //   argv     = argv[0] (skipped) flag* positional+
-  //   flag     = "-n" | "-A" | "--schema"    (boolean, arity 0)
-  //   positional = <NUL-terminated bytes; length ≤ NAME_MAX_LEN>
-  //
-  // Short flags MUST be exactly one letter after '-'. Anything
-  // longer (e.g. "-nA") is rejected as
-  // PARSE_ERR_UNKNOWN_OR_CLUSTERED_SHORT per the D3 one-per-hyphen
-  // contract.
-  //
-  // Long flags MUST match the whitelist. "--schema" is the only
-  // long flag accepted at M1. Bare "--" or "--=foo" is
-  // PARSE_ERR_LONG_MISSING_NAME. Any other long flag is
-  // PARSE_ERR_UNKNOWN_LONG_FLAG.
-  //
-  // Positional length is checked byte-by-byte with a NAME_MAX_LEN
-  // bound guard so a pathological argv[i] without any NUL cannot
-  // walk off the end forever.
-  //
-  // Register plan (leaf; no callee-save touched):
-  //   r8  = i          (arg loop counter)
-  //   r9  = argv       (base copy of rdi)
-  //   r10 = argc       (copy of rsi)
-  //   r11 = scratch    (paideia-as reserved; every .bss lea)
-  //   rax = byte load / return
-  //   rcx = walk cursor / measured-len accumulator
-  //   rdx = current argv[i] pointer
+  // See design/architecture.md §2 for the full grammar. Preserved
+  // verbatim from M1 (libpdx-argv M2 has since landed FKIND_UNKNOWN
+  // = 0xFF returning as boolean, which would let us migrate; the
+  // migration is scheduled at cat.M3 in the plan so the M2 wave
+  // stays byte-compatible with the M1 fixtures).
   // ============================================================================
   pub let cat_parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-002 cat_parse_argv. Walks argv[1..argc-1]; classifies each arg as long-flag / short-flag / positional per design/architecture.md §2 grammar. Boolean-only flags (arity 0 — a shell that wrote 'cat -n foo.txt' means cat reads foo.txt, not that -n's value is foo.txt; libpdx-argv M1-002's greedy value-lookahead would misparse this, which is why cat rolls its own scan at M1). Long-flag whitelist at M1: --schema only (byte-exact compare against 's','c','h','e','m','a' + NUL, mirror of libpdx-argv's --pdx-schema inline compare). Short-flag whitelist at M1: -n and -A (single-letter after '-' + NUL). Positional accumulator uses pos_ptrs[pos_count] and enforces POS_MAX = 8 (M2-003 removes the cap). Every positional walked to NUL with NAME_MAX_LEN = 236 bound to protect against argv without terminator. All immediates in `cmp reg, imm` are ≤ 0x7FFFFFFF (max 236). Every byte load preceded by xor rax,rax (#1248). Leaf function — no callee-save touched, no push/pop.",
+      justification: "cat.M1-002 cat_parse_argv. Preserved verbatim across the M2 wave — libpdx-argv M2's FKIND_UNKNOWN=boolean fix removes the original blocker, but migrating cat's argv surface to libpdx-argv is scheduled at cat.M3 per r49-r50-plan.md §5.5 so the M2 wave keeps byte-compat with the M1 golden fixtures. Walks argv[1..argc-1]; classifies each arg as long-flag / short-flag / positional per design/architecture.md §2 grammar. Boolean-only flags (arity 0 — a shell that wrote 'cat -n foo.txt' means cat reads foo.txt, not that -n's value is foo.txt). Long-flag whitelist: --schema only (byte-exact compare). Short-flag whitelist: -n and -A. Positional accumulator uses pos_ptrs[pos_count] and enforces POS_MAX = 8. Every positional walked to NUL with NAME_MAX_LEN = 236 bound. All immediates in `cmp reg, imm` are ≤ 0x7FFFFFFF (max 236). Every byte load preceded by xor rax,rax (#1248). Leaf function.",
       block: {
-        // ---- prologue --------------------------------------------------
-        mov r9, rdi;                    // r9  = argv base
-        mov r10, rsi;                   // r10 = argc
-        mov r8, 1;                      // r8  = i (skip argv[0])
+        mov r9, rdi;
+        mov r10, rsi;
+        mov r8, 1;
 
       cat_parse_loop_head:
         cmp r8, r10;
         jge cat_parse_done_ok;
 
-        mov rdx, [r9 + r8*8];           // rdx = argv[i]
+        mov rdx, [r9 + r8*8];
 
-        // byte0 = rdx[0]. '-' == 0x2D.
         xor rax, rax;
         mov_b rax, [rdx];
         cmp rax, 0x2D;
@@ -197,67 +171,50 @@ module CatDispatch = structure {
         jmp cat_parse_positional;
 
       cat_parse_maybe_flag:
-        // byte1 = rdx[1]. '-' → long, NUL → bare '-' (positional
-        // per POSIX convention for stdin), else → short.
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0x2D;
         je cat_parse_long_flag;
         cmp rax, 0;
-        je cat_parse_positional;        // bare "-" is a positional
+        je cat_parse_positional;
         jmp cat_parse_short_flag;
 
-        // ============================================================
-        //   Long-flag branch: only --schema accepted at M1
-        // ============================================================
       cat_parse_long_flag:
-        // byte2 = rdx[2]. NUL → bare "--"; '=' → "--=..." → both
-        // are PARSE_ERR_LONG_MISSING_NAME.
         xor rax, rax;
         mov_b rax, [rdx + 2];
         cmp rax, 0;
         je cat_parse_long_missing;
-        cmp rax, 0x3D;                  // '=' == 0x3D
+        cmp rax, 0x3D;
         je cat_parse_long_missing;
 
-        // Byte-exact "--schema" match. Bytes at rdx+2..rdx+7 must be
-        // 's','c','h','e','m','a', and rdx+8 must be NUL. Any
-        // mismatch → PARSE_ERR_UNKNOWN_LONG_FLAG.
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x73; jne cat_parse_unknown_long;   // 's'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x63; jne cat_parse_unknown_long;   // 'c'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x68; jne cat_parse_unknown_long;   // 'h'
-        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x65; jne cat_parse_unknown_long;   // 'e'
-        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6D; jne cat_parse_unknown_long;   // 'm'
-        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0x61; jne cat_parse_unknown_long;   // 'a'
-        xor rax, rax; mov_b rax, [rdx + 8]; cmp rax, 0;    jne cat_parse_unknown_long;   // NUL
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x73; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x63; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x68; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x65; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6D; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0x61; jne cat_parse_unknown_long;
+        xor rax, rax; mov_b rax, [rdx + 8]; cmp rax, 0;    jne cat_parse_unknown_long;
 
-        // Match. Set FLAG_SCHEMA bit.
         lea r11, [rip + flag_mask];
         mov rax, [r11];
-        or  rax, 0x4;                   // FLAG_SCHEMA
+        or  rax, 0x4;
         mov [r11], rax;
         jmp cat_parse_advance;
 
       cat_parse_unknown_long:
-        mov rax, 1;                     // PARSE_ERR_UNKNOWN_LONG_FLAG
+        mov rax, 1;
         jmp cat_parse_fail;
 
       cat_parse_long_missing:
-        mov rax, 4;                     // PARSE_ERR_LONG_MISSING_NAME
+        mov rax, 4;
         jmp cat_parse_fail;
 
-        // ============================================================
-        //   Short-flag branch: -n / -A single-letter only
-        // ============================================================
       cat_parse_short_flag:
-        // rdx[1] is the letter. rdx[2] must be NUL — anything else
-        // is a clustered short like "-nA" and is rejected.
         xor rax, rax;
         mov_b rax, [rdx + 2];
         cmp rax, 0;
         jne cat_parse_unknown_short;
 
-        // rdx[1] letter dispatch: 'n' = 0x6E, 'A' = 0x41.
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0x6E;
@@ -269,34 +226,28 @@ module CatDispatch = structure {
       cat_parse_short_n:
         lea r11, [rip + flag_mask];
         mov rax, [r11];
-        or  rax, 0x1;                   // FLAG_N
+        or  rax, 0x1;
         mov [r11], rax;
         jmp cat_parse_advance;
 
       cat_parse_short_A:
         lea r11, [rip + flag_mask];
         mov rax, [r11];
-        or  rax, 0x2;                   // FLAG_A
+        or  rax, 0x2;
         mov [r11], rax;
         jmp cat_parse_advance;
 
       cat_parse_unknown_short:
-        mov rax, 2;                     // PARSE_ERR_UNKNOWN_OR_CLUSTERED_SHORT
+        mov rax, 2;
         jmp cat_parse_fail;
 
-        // ============================================================
-        //   Positional branch
-        // ============================================================
       cat_parse_positional:
-        // Length check: walk rdx to NUL, bounded at NAME_MAX_LEN.
         mov rcx, rdx;
-        xor rax, rax;                   // reuse rax as len accumulator? No — need for byte load.
-        // Use r11 as the len accumulator here (paideia-as scratch;
-        // no .bss access happens in this loop body until the store).
+        xor rax, rax;
         xor r11, r11;
 
       cat_parse_pos_measure_head:
-        cmp r11, 236;                   // NAME_MAX_LEN
+        cmp r11, 236;
         jg cat_parse_name_too_long;
 
         xor rax, rax;
@@ -308,21 +259,14 @@ module CatDispatch = structure {
         jmp cat_parse_pos_measure_head;
 
       cat_parse_pos_measure_done:
-        // Reject empty positional (argv[i] == "\0"). A bare "-"
-        // routes here from the long-flag branch and IS a valid
-        // positional (M2-004 uses it for stdin), so we do NOT
-        // reject len == 1 with rdx[0] == '-'. But len == 0 (empty
-        // string) is never valid.
         cmp r11, 0;
         je cat_parse_empty_pos;
 
-        // pos_count bound check.
         lea r11, [rip + pos_count];
         mov rax, [r11];
-        cmp rax, 8;                     // POS_MAX
+        cmp rax, 8;
         jge cat_parse_pos_overflow;
 
-        // Store pos_ptrs[pos_count] = rdx and bump pos_count.
         lea r11, [rip + pos_ptrs];
         mov [r11 + rax*8], rdx;
 
@@ -332,36 +276,28 @@ module CatDispatch = structure {
         jmp cat_parse_advance;
 
       cat_parse_empty_pos:
-        // An empty argv entry is a usage error — collapse to the
-        // same code as pos overflow's caller-visible exit 2. Use
-        // the same PARSE_ERR_POS_OVERFLOW code so the diagnostic
-        // renderer prints one uniform "positional slot" message.
-        mov rax, 3;                     // PARSE_ERR_POS_OVERFLOW
+        mov rax, 3;
         jmp cat_parse_fail;
 
       cat_parse_pos_overflow:
-        mov rax, 3;                     // PARSE_ERR_POS_OVERFLOW
+        mov rax, 3;
         jmp cat_parse_fail;
 
       cat_parse_name_too_long:
-        mov rax, 5;                     // PARSE_ERR_NAME_TOO_LONG
+        mov rax, 5;
         jmp cat_parse_fail;
 
-        // ============================================================
-        //   Loop advance / termination
-        // ============================================================
       cat_parse_advance:
         add r8, 1;
         jmp cat_parse_loop_head;
 
       cat_parse_fail:
-        // rax = error code. Record offending arg index + return.
         lea r11, [rip + parse_error_arg_index];
         mov [r11], r8;
         ret
 
       cat_parse_done_ok:
-        xor rax, rax;                   // PARSE_OK
+        xor rax, rax;
         ret
       }
     }
@@ -370,112 +306,159 @@ module CatDispatch = structure {
   // cat_dispatch(argv, argc) -> exit_code
   //
   // Signature: cat_dispatch : (u64, u64) -> u64 !{mem} @{}
-  //   RDI: argv (u64* — array of NUL-terminated arg pointers)
-  //   RSI: argc (count of entries in argv)
+  //   RDI: argv
+  //   RSI: argc
   //   RAX: exit code (0 / 2 / 3 / 4 per I4)
   //
-  // M1-003 flow:
-  //   1. cat_reset() — zero parsed state.
-  //   2. cat_parse_argv(argv, argc) — parse flags + positional list.
-  //      Non-zero return → CAT_EXIT_USAGE_ERROR (2).
-  //   3. If pos_count == 0 → CAT_EXIT_USAGE_ERROR (M2-004 replaces
-  //      this arm with stdin passthrough).
-  //   4. Call file_read_stub (FileRead::file_read_stub in
-  //      src/file_read.pdx). rax == 0 → CAT_EXIT_CAP_DENIED (4).
-  //      At M1 the stub always returns 0; the fall-through arm is
-  //      structurally wired but unreachable until M2's KIND_PDXFS_
-  //      FILE(read) lands.
-  //   5. tty_reset() then tty_write_bytes(src_ptr, src_len). Sink
-  //      overflow → CAT_EXIT_SYSTEM_ERROR (3). Success →
-  //      CAT_EXIT_OK (0).
+  // M2 top-level: parse argv → set up render + sink → stream every
+  // positional file (or stdin when pos_count == 0) through the
+  // render pipeline into the sink. See file header for the full
+  // flow.
   //
-  // Register plan (non-leaf; three nested calls):
-  //   r12 = argv (callee-save copy of rdi)
-  //   r13 = argc (callee-save copy of rsi)
-  //   Alignment pad: three pushes → rsp%16 == 0 at each nested
-  //   call. r14 pushed as pad-only carry to preserve SysV parity.
+  // Register plan (5-push callee-save prologue for 16-byte align):
+  //   rbx = current file handle (across file_read_chunk calls)
+  //   r12 = argv (initial); reused after parse for scratch
+  //   r13 = argc (initial); reused after parse for pos_count snapshot
+  //   r14 = current positional index i (file loop)
+  //   r15 = alignment pad (unused)
+  //   rax = byte load / call return
+  //   rcx = scratch
+  //   rdi/rsi/rdx = call args
+  //   r11 = lea scratch (paideia-as reserved)
   //
-  // rsp arithmetic:
-  //   caller-of-cat_dispatch: rsp%16 == 0 immediately before call
-  //   after CALL:             rsp%16 == 8 (return address pushed)
-  //   after push r12:         rsp%16 == 0
-  //   after push r13:         rsp%16 == 8
-  //   after push r14:         rsp%16 == 0  ← nested call sites ok
-  //   epilogue mirrors.
+  // rsp arithmetic: entry rsp%16 == 8 (post-CALL). 5 pushes lands
+  // rsp%16 == 0 at every nested call site.
   // ============================================================================
   pub let cat_dispatch : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-003 cat_dispatch. Sequences cat_reset → cat_parse_argv → pos_count check → file_read_stub → tty_reset → tty_write_bytes. Parse failure collapses to CAT_EXIT_USAGE_ERROR (2). Zero positionals collapses to CAT_EXIT_USAGE_ERROR (M2-004 replaces with stdin passthrough). file_read_stub == 0 collapses to CAT_EXIT_CAP_DENIED (4). tty_write_bytes TTY_SINK_OVERFLOW collapses to CAT_EXIT_SYSTEM_ERROR (3). Non-leaf: 3-push prologue (r12/r13/r14) preserves argc/argv across cat_parse_argv and keeps rsp%16 == 0 at every nested call site. After the file-read stub returns the src ptr, r12 is reused (argv is no longer needed) to stash the ptr across the tty_reset call. Mirror-order pop in epilogue. All immediates ≤ 0x7FFFFFFF (max: 4 for CAT_EXIT_CAP_DENIED). r11 scratch for the pos_count and file_src_len .bss reads. file_src_len is FileRead::file_src_len (src/file_read.pdx), resolved by unqualified linker name.",
+      justification: "cat.M2-001+M2-002+M2-003+M2-004 cat_dispatch. Sequences cat_reset → cat_parse_argv → tty_reset → render_reset(flag_mask) → branch on pos_count → per-file streaming (or stdin streaming). Streaming loop uses FileRead::fr_chunk_buf (64 KiB .bss) as staging area — file_read_chunk / stdin_read_chunk cap per-call bytes at CHUNK_MAX = 65536, and cat_dispatch loops until EOF (0-byte read). Every nested call return checked: parse failure → CAT_EXIT_USAGE_ERROR (2); render_write_bytes non-zero → CAT_EXIT_SYSTEM_ERROR (3); file_open == 0 → CAT_EXIT_CAP_DENIED (4). file_close return ignored (M2 no-op; R42 close-fail becomes CAT_EXIT_SYSTEM_ERROR — a body-only edit at that time). 5-push callee-save prologue (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every nested call site. r12/r13 hold argv/argc during parse then get reused (r13 = pos_count snapshot after parse); rbx holds the current file handle across the inner streaming loop; r14 is the file-loop index. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest for CHUNK_MAX). cat_dispatch does NOT reset the FileRead / StdinSource seed tables — those are M2-stub-only test state that the M4 harness sets up BEFORE calling cat_dispatch (see file header for the R42-substrate note that removes seed tables entirely).",
       block: {
-        // ---- prologue: save + align ------------------------------------
+        // ---- prologue: 5 pushes for 16-byte alignment -----------------
+        push rbx;
         push r12;
         push r13;
         push r14;
+        push r15;
 
         mov r12, rdi;                   // r12 = argv
         mov r13, rsi;                   // r13 = argc
 
-        // ---- Step 1: reset parser state --------------------------------
+        // ---- Step 1: reset parser state -------------------------------
         call cat_reset;
 
-        // ---- Step 2: parse argv ----------------------------------------
+        // ---- Step 2: parse argv ---------------------------------------
         mov rdi, r12;
         mov rsi, r13;
         call cat_parse_argv;
         cmp rax, 0;
-        jne cat_dispatch_usage_error;
+        jne cd_usage_error;
 
-        // ---- Step 3: require ≥ 1 positional at M1 (stdin at M2-004) --
-        lea r11, [rip + pos_count];
-        mov rax, [r11];
-        cmp rax, 0;
-        je cat_dispatch_usage_error;
-
-        // ---- Step 4: stubbed file read ---------------------------------
-        // file_read_stub is FileRead::file_read_stub in
-        // src/file_read.pdx (M1-003 re-host). Contract: rax = src
-        // ptr (0 = not found); FileRead::file_src_len holds the
-        // byte count.
-        call file_read_stub;
-        cmp rax, 0;
-        je cat_dispatch_cap_denied;
-
-        // ---- Step 5: reset the sink + write bytes ----------------------
-        // Stash the file-read src ptr in r12 (argv is no longer
-        // needed at this point — cat_dispatch's argv/argc were
-        // consumed by cat_parse_argv above). This preserves the
-        // pointer across the tty_reset call which is otherwise
-        // free to clobber caller-save regs.
-        mov r12, rax;
-
+        // ---- Step 3: reset sink + render state ------------------------
         call tty_reset;
 
-        mov rdi, r12;                   // rdi = src ptr
-        lea r11, [rip + file_src_len];
-        mov rsi, [r11];                 // rsi = src len
-        call tty_write_bytes;
+        // render_reset(flag_mask)
+        lea r11, [rip + flag_mask];
+        mov rdi, [r11];
+        call render_reset;
+
+        // ---- Step 4: load pos_count snapshot into r13 -----------------
+        // (argc no longer needed; reuse r13.)
+        lea r11, [rip + pos_count];
+        mov r13, [r11];
+
+        // Branch on pos_count.
+        cmp r13, 0;
+        je cd_stdin_path;
+        jmp cd_file_path;
+
+        // ==============================================================
+        //   File path (M2-001 multi-file + M2-003 streaming)
+        // ==============================================================
+      cd_file_path:
+        xor r14, r14;                   // i = 0
+
+      cd_file_outer_head:
+        cmp r14, r13;
+        jge cd_ok;
+
+        // file_open(pos_ptrs[r14])
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + r14*8];
+        call file_open;
         cmp rax, 0;
-        jne cat_dispatch_system_error;
+        je cd_cap_denied;
+        mov rbx, rax;                   // rbx = handle
 
-        xor rax, rax;                   // CAT_EXIT_OK
-        jmp cat_dispatch_epilogue;
+      cd_file_inner_head:
+        // file_read_chunk(handle, fr_chunk_buf, CHUNK_MAX)
+        mov rdi, rbx;                   // handle
+        lea rsi, [rip + fr_chunk_buf];  // dst
+        mov rdx, 65536;                 // CHUNK_MAX
+        call file_read_chunk;
+        cmp rax, 0;
+        je cd_file_inner_done;          // 0 bytes = EOF
 
-      cat_dispatch_system_error:
-        mov rax, 3;                     // CAT_EXIT_SYSTEM_ERROR
-        jmp cat_dispatch_epilogue;
+        // render_write_bytes(fr_chunk_buf, bytes)
+        lea rdi, [rip + fr_chunk_buf];
+        mov rsi, rax;                   // bytes read
+        call render_write_bytes;
+        cmp rax, 0;
+        jne cd_system_error;
+        jmp cd_file_inner_head;
 
-      cat_dispatch_usage_error:
-        mov rax, 2;                     // CAT_EXIT_USAGE_ERROR
-        jmp cat_dispatch_epilogue;
+      cd_file_inner_done:
+        // file_close(handle) — M2 no-op; return ignored.
+        mov rdi, rbx;
+        call file_close;
 
-      cat_dispatch_cap_denied:
-        mov rax, 4;                     // CAT_EXIT_CAP_DENIED
+        add r14, 1;
+        jmp cd_file_outer_head;
 
-      cat_dispatch_epilogue:
+        // ==============================================================
+        //   Stdin path (M2-004 streaming stdin passthrough)
+        // ==============================================================
+      cd_stdin_path:
+      cd_stdin_head:
+        // stdin_read_chunk(fr_chunk_buf, CHUNK_MAX)
+        lea rdi, [rip + fr_chunk_buf];
+        mov rsi, 65536;                 // CHUNK_MAX
+        call stdin_read_chunk;
+        cmp rax, 0;
+        je cd_ok;                       // 0 = EOF
+
+        // render_write_bytes(fr_chunk_buf, bytes)
+        lea rdi, [rip + fr_chunk_buf];
+        mov rsi, rax;
+        call render_write_bytes;
+        cmp rax, 0;
+        jne cd_system_error;
+        jmp cd_stdin_head;
+
+        // ==============================================================
+        //   Exit code assembly + epilogue
+        // ==============================================================
+      cd_ok:
+        xor rax, rax;
+        jmp cd_epilogue;
+
+      cd_system_error:
+        mov rax, 3;
+        jmp cd_epilogue;
+
+      cd_usage_error:
+        mov rax, 2;
+        jmp cd_epilogue;
+
+      cd_cap_denied:
+        mov rax, 4;
+
+      cd_epilogue:
+        pop r15;
         pop r14;
         pop r13;
         pop r12;
+        pop rbx;
         ret
       }
     }
@@ -484,43 +467,34 @@ module CatDispatch = structure {
   // cat_dispatch_from_buf(buf, buf_len) -> exit_code
   //
   // Signature: cat_dispatch_from_buf : (u64, u64) -> u64 !{mem} @{}
-  //   RDI: buf     — pointer to caller-owned byte buffer
-  //   RSI: buf_len — byte length of buf
-  //   RAX: exit code (0 = OK, 3 = system error / sink overflow;
-  //        never returns 2 or 4 since no argv + no file-read
-  //        involved)
+  //   RDI: buf ptr
+  //   RSI: byte count
+  //   RAX: 0 on OK, 3 on sink overflow
   //
-  // Alt entry that skips the argv + file-read steps and drives the
-  // TtySink directly. Used by M4 tests + the M1 smoke fixture.
-  // The wire contract matches cat_dispatch's tail so a caller that
-  // already has bytes in memory does not need to fabricate an argv
-  // or a stubbed file table.
+  // Alt entry preserved from M1-003 for the raw bytes-through-sink
+  // test harness. Bypasses argv, file read, AND the render layer —
+  // drives `tty_write_bytes` directly. Used by pre-M2 fixtures + as
+  // a smoke check that tty_write_bytes' 64-KiB M2 cap is honoured.
   //
-  // Non-leaf; passes rdi + rsi to tty_write_bytes after a
-  // tty_reset. The buf/buf_len must survive the tty_reset call, so
-  // r12 stashes buf and r13 stashes buf_len.
+  // The M2 render pipeline is exercised via `cat_dispatch` with a
+  // pre-seeded FileRead::seed table (see file header).
   //
-  // Register plan (non-leaf; two nested calls):
-  //   r12 = buf     (callee-save copy of rdi)
-  //   r13 = buf_len (callee-save copy of rsi)
-  //   r14 = pad-only (preserves SysV parity + rsp%16 == 0 alignment)
-  //
-  // rsp arithmetic (same as cat_dispatch):
-  //   entry rsp%16 == 8 → 3 pushes → rsp%16 == 0 at each nested
-  //   call site.
+  // Register plan (3-push callee-save + pad; unchanged from M1):
+  //   r12 = buf
+  //   r13 = buf_len
+  //   r14 = pad
   // ============================================================================
   pub let cat_dispatch_from_buf : (u64, u64) -> u64 !{mem} @{} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-003 cat_dispatch_from_buf. Alt entry that skips argv + file lookup and drives the TtySink directly. Stashes rdi (buf) in r12 and rsi (buf_len) in r13 across the tty_reset call, then forwards them to tty_write_bytes. Return codes: TtySink's TTY_OK collapses to CAT_EXIT_OK (0); TTY_SINK_OVERFLOW collapses to CAT_EXIT_SYSTEM_ERROR (3) — matching KIND_TTY(write)'s partial-write shape at M2. Non-leaf: 3-push prologue (r12/r13/r14) preserves the args across tty_reset and keeps rsp%16 == 0 at every nested call site. Mirror-order pop in epilogue. r14 is push-only (alignment pad).",
+      justification: "cat.M1-003 cat_dispatch_from_buf. Alt entry preserved through M2: drives TtySink::tty_write_bytes directly, bypassing argv + file read + render. Useful for smoke-checking the M2 65536-byte sink cap and as a pre-shell.M4 bytes-through-sink harness. 3-push prologue (r12 / r13 / r14 as pad) — entry rsp%16 == 8 (post-CALL); +3*8 = 24; (8 + 24) mod 16 = 0 → nested call site aligned. r12/r13 preserve buf/buf_len across the tty_reset call which is free to clobber caller-save regs.",
       block: {
-        // ---- prologue: save + align ------------------------------------
         push r12;
         push r13;
         push r14;
 
-        mov r12, rdi;                   // r12 = buf
-        mov r13, rsi;                   // r13 = buf_len
+        mov r12, rdi;
+        mov r13, rsi;
 
         call tty_reset;
 
@@ -530,11 +504,11 @@ module CatDispatch = structure {
         cmp rax, 0;
         jne cat_disp_buf_system_error;
 
-        xor rax, rax;                   // CAT_EXIT_OK
+        xor rax, rax;
         jmp cat_disp_buf_epilogue;
 
       cat_disp_buf_system_error:
-        mov rax, 3;                     // CAT_EXIT_SYSTEM_ERROR
+        mov rax, 3;
 
       cat_disp_buf_epilogue:
         pop r14;

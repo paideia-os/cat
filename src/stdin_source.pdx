@@ -1,0 +1,207 @@
+// src/stdin_source.pdx — cat.M2-004
+// StdinSource module: streaming stdin passthrough via KIND_IPC_ENDPOINT.
+//
+// When `cat` is invoked with zero positional file arguments, its
+// input is stdin — a KIND_IPC_ENDPOINT frame stream fed by whatever
+// upstream shell pipeline supplies bytes on its stdout endpoint
+// (D2 semantic pipe layer per design/tooling/plan.md §3).
+//
+// R20b-substrate note (per r49-r50-plan.md §2.4)
+// ----------------------------------------------
+// `KIND_IPC_ENDPOINT` is base kind 5, landed at R20b. The pieces
+// still missing at HEAD (2026-08-21) for a live stdin path are:
+//   - shell.M4 KIND_TTY handoff (also needed by the file path;
+//     tracked at r49-r50-plan.md §5.2 shell.M4).
+//   - shell.M2 pipeline mint of the KIND_IPC_ENDPOINT frame carrier
+//     between two child processes (r49-r50-plan.md §5.2 shell.M2).
+// So M2 here stops short of the sys_ipc_recv wrapper and ships a
+// test-seedable stub whose SHAPE matches the R20b-real version.
+// The stub owns a single-source (buf, len, cursor) triple; the M4
+// harness pre-seeds it via `stdin_seed(buf, len)`; `stdin_read_
+// chunk(dst, cap)` streams the seed in ≤ cap-byte chunks with the
+// same CHUNK_MAX = 65536 (FileRead::CHUNK_MAX) shape file_read_chunk
+// uses. With no seed pushed `stdin_read_chunk` returns 0 (EOF) on
+// the first call, which cat_dispatch treats identically to
+// end-of-input on a live stdin.
+//
+// Shape parity with FileRead::file_read_chunk lets the M2 render +
+// dispatch code drive both sources through a single per-chunk loop
+// — the only branch is on the pos_count == 0 / != 0 gate at the
+// top of cat_dispatch.
+//
+// Contract
+// --------
+//   stdin_reset : () -> () !{mem} @{}
+//     Zero sr_stdin_buf, sr_stdin_len, sr_stdin_cursor. Called once by
+//     `cat_dispatch` before parsing argv.
+//
+//   stdin_seed : (u64, u64) -> () !{mem} @{}
+//     RDI: buf ptr
+//     RSI: byte count
+//     Seeds the single-source triple. M4 test-only. R42 or the
+//     shell.M2 pipeline landing deletes this call.
+//
+//   stdin_read_chunk : (u64, u64) -> u64 !{mem} @{}
+//     RDI: dst ptr
+//     RSI: dst cap (max bytes; capped at CHUNK_MAX)
+//     RAX: bytes copied (0 = EOF)
+//     Streams up to min(cap, CHUNK_MAX, remaining) bytes.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`StdinSource`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     65536 for CHUNK_MAX).
+//   - r11 scratch; reloaded before every `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - No `sub reg, reg`; no negative `add reg, imm`. The per-iter
+//     bound-check pattern from FileRead::file_read_chunk is reused
+//     verbatim here.
+//   - All functions are leaf (no `call` inside).
+
+module StdinSource = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  // Duplicated from FileRead::CHUNK_MAX for symmetry — both source
+  // modules honour the same 64 KiB per-chunk cap per
+  // r49-r50-plan.md §5.5 M2-003.
+  pub let CHUNK_MAX : u64 = 65536
+
+  // ============================================================================
+  // Singleton stdin source triple (M2-stub; deleted at shell.M2 landing)
+  // ============================================================================
+  pub let mut sr_stdin_buf    : u64 = uninit @align(8)  // seed base ptr; 0 = no seed → EOF on first read
+  pub let mut sr_stdin_len    : u64 = uninit @align(8)  // seed total bytes
+  pub let mut sr_stdin_cursor : u64 = uninit @align(8)  // bytes already read
+
+  // ============================================================================
+  // stdin_reset()
+  //
+  // Signature: stdin_reset : () -> () !{mem} @{}
+  //
+  // Zero sr_stdin_buf, sr_stdin_len, sr_stdin_cursor. Called once by
+  // `cat_dispatch` before parsing argv so a fresh dispatch starts
+  // from a known baseline; the M4 harness then optionally re-seeds
+  // via stdin_seed.
+  //
+  // Leaf function; r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let stdin_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-004 stdin_reset. Zero the three-slot stdin source triple so a fresh dispatch starts from EOF-on-first-read unless the M4 harness reseeds. Leaf function; r11 scratch.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + sr_stdin_buf];    mov [r11], rax;
+        lea r11, [rip + sr_stdin_len];    mov [r11], rax;
+        lea r11, [rip + sr_stdin_cursor]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // stdin_seed(buf, len)
+  //
+  // Signature: stdin_seed : (u64, u64) -> () !{mem} @{}
+  //   RDI: buf ptr
+  //   RSI: byte count
+  //
+  // Sets sr_stdin_buf = rdi and sr_stdin_len = rsi. sr_stdin_cursor is
+  // NOT touched — callers pair stdin_seed with stdin_reset when
+  // they want a fresh cursor (stdin_reset already zeroes cursor).
+  //
+  // Leaf function; r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let stdin_seed : (u64, u64) -> () !{mem} @{} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-004 stdin_seed. M4 test harness helper: sets sr_stdin_buf + sr_stdin_len. Cursor is left alone — callers pair with stdin_reset to zero it. Leaf function; r11 scratch. Deleted at the shell.M2 pipeline landing.",
+      block: {
+        lea r11, [rip + sr_stdin_buf]; mov [r11], rdi;
+        lea r11, [rip + sr_stdin_len]; mov [r11], rsi;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // stdin_read_chunk(dst, cap) -> bytes
+  //
+  // Signature: stdin_read_chunk : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: dst ptr
+  //   RSI: dst cap (max bytes; capped at CHUNK_MAX)
+  //   RAX: bytes copied (0 = EOF)
+  //
+  // Streams up to min(cap, CHUNK_MAX, remaining) bytes from
+  // sr_stdin_buf + sr_stdin_cursor into [dst, dst + bytes). Advances
+  // sr_stdin_cursor by bytes. Zero return means EOF (all seed
+  // bytes consumed OR no seed pushed).
+  //
+  // Register plan (leaf; no external call):
+  //   r9  = sr_stdin_buf         (source base)
+  //   r10 = sr_stdin_cursor      (current cursor; live, updated in place)
+  //   r8  = sr_stdin_len         (total; source EOF bound)
+  //   rcx = bytes copied so far (running count)
+  //   rax = byte load / return
+  //   rdi = dst walking cursor (starts at rdi = dst base)
+  //   rsi = dst cap (upper bound)
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let stdin_read_chunk : (u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-004 stdin_read_chunk. M2-stub streaming stdin read: per-iter min(cap, CHUNK_MAX, remaining) enforced by three cmp+jge guards (`cmp rcx, 65536`, `cmp rcx, rsi`, `cmp r10, r8`) — same shape as FileRead::file_read_chunk so cat_dispatch's per-chunk loop is source-agnostic. Loads sr_stdin_buf into r9, sr_stdin_cursor into r10 (live cursor), sr_stdin_len into r8. Copy loop uses `lea r11, [r9 + r10*1]; xor rax,rax; mov_b rax, [r11]` for src (#1248) and `lea r11, [rdi + rcx*1]; mov_b [r11], rax` for dst (caller-owned). Persists updated cursor via `lea r11, [rip + sr_stdin_cursor]; mov [r11], r10`. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest). Leaf function; no callee-save touched.",
+      block: {
+        // ---- Load state ------------------------------------------------
+        lea r11, [rip + sr_stdin_buf];    mov r9,  [r11];
+        lea r11, [rip + sr_stdin_cursor]; mov r10, [r11];
+        lea r11, [rip + sr_stdin_len];    mov r8,  [r11];
+
+        // sr_stdin_buf == 0 → no seed → EOF.
+        cmp r9, 0;
+        je stdin_read_eof;
+
+        xor rcx, rcx;                  // bytes-copied running count
+
+      stdin_read_head:
+        // Guard 1: rcx < CHUNK_MAX
+        cmp rcx, 65536;                // CHUNK_MAX
+        jge stdin_read_done;
+        // Guard 2: rcx < cap (rsi)
+        cmp rcx, rsi;
+        jge stdin_read_done;
+        // Guard 3: r10 < total (r8)
+        cmp r10, r8;
+        jge stdin_read_done;
+
+        // src byte at sr_stdin_buf + cursor
+        lea r11, [r9 + r10*1];
+        xor rax, rax;
+        mov_b rax, [r11];
+
+        // dst byte at dst + bytes-copied (caller-owned)
+        lea r11, [rdi + rcx*1];
+        mov_b [r11], rax;
+
+        add r10, 1;                    // cursor++
+        add rcx, 1;                    // bytes-copied++
+        jmp stdin_read_head;
+
+      stdin_read_done:
+        // Persist cursor.
+        lea r11, [rip + sr_stdin_cursor];
+        mov [r11], r10;
+
+        mov rax, rcx;                  // rax = bytes copied
+        ret
+
+      stdin_read_eof:
+        xor rax, rax;
+        ret
+      }
+    }
+}

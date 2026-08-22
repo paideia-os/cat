@@ -1,27 +1,24 @@
-// src/tty_sink.pdx — cat.M1-003
+// src/tty_sink.pdx — cat.M1-003 (skeleton) → cat.M2-001..M2-004
 // TtySink module: bounded write sink standing in for KIND_TTY(write).
 //
 // Design context
 // --------------
-// M1's sink is a 4 KiB `.bss` scratch buffer with a cursor. The M1
-// alt entry `CatDispatch::cat_dispatch_from_buf(buf, buf_len)`
-// exercises the buf → sink pipeline end-to-end without needing R42
-// substrate (KIND_PDXFS_FILE) or shell.M4 (KIND_TTY handoff), both
-// of which are blockers at HEAD (2026-08-21) per r49-r50-plan.md
-// §2.4. M2 replaces the sink with a `KIND_TTY(write)` syscall via
-// libpdx-cap; the module's `.bss` slot names do not change, so
-// the M2 patch is a leaf-function body edit inside
-// `tty_write_bytes` (the sink store becomes a syscall wrapper).
+// M1's sink was a 4 KiB `.bss` scratch buffer with a cursor. M2
+// widens the cap to 64 KiB (65536) so the M2 render + streaming
+// paths — which drive the sink chunk-by-chunk from the 64 KiB
+// FileRead::chunk_buf plus per-byte from Render::render_write_bytes
+// (line-numbering prefix + -A escapes may inflate output beyond the
+// input byte count) — can be exercised end-to-end from an M4 test
+// harness without exhausting the sink on the first chunk. M2 also
+// adds `tty_write_byte(byte)` — a leaf single-byte-write helper the
+// Render module calls per emitted output byte (line-num digits,
+// `^X` escapes, `$` end-of-line markers).
 //
-// Why a bounded sink at M1
-// ------------------------
-// The 4 KiB cap is a placeholder for the real KIND_TTY(write)
-// throughput at M2. A body larger than 4 KiB returns
-// TTY_SINK_OVERFLOW, which `cat_dispatch` collapses to
-// CAT_EXIT_SYSTEM_ERROR (3) — the same exit code M2's
-// KIND_TTY(write) partial-write returns for an I/O failure, so the
-// caller's error-handling code does not change across the M1→M2
-// migration.
+// The real KIND_TTY(write) at shell.M4 has no cap; the sink cap
+// exists only for the pre-shell.M4 test harness. Field names
+// (`tty_out_buf`, `tty_out_len`) do not change between M1 and M2 —
+// the shell.M4 patch is still a leaf-function body edit inside
+// `tty_write_bytes` + `tty_write_byte`.
 //
 // Contract
 // --------
@@ -38,18 +35,28 @@
 //     copied. Overflow leaves tty_out_len at the partial-write
 //     cursor — matches KIND_TTY(write)'s partial-write shape.
 //
+//   tty_write_byte : (u64) -> u64 !{mem} @{}
+//     RDI: byte value in low 8 bits (upper bits ignored via mov_b)
+//     RAX: TTY_OK (0) on success, TTY_SINK_OVERFLOW at cap
+//     M2-002 helper. Render layer calls this per emitted output
+//     byte (line-num digits + `^X` escape sequences); using a
+//     tight single-byte helper avoids fabricating a stack-local
+//     one-byte buffer at every call site. Body-only shell.M4 patch
+//     will replace the sink store with a KIND_TTY(write) syscall.
+//
 // paideia-as compliance
 // ---------------------
 //   - Module name PascalCase basename (`TtySink`), no directory
 //     prefix.
 //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
-//     4096 for TTY_OUT_CAP).
+//     65536 for TTY_OUT_CAP).
 //   - r11 scratch; reloaded before every `.bss` read/write.
 //   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248
 //     mitigation).
-//   - `tty_reset` and `tty_write_bytes` are both leaf functions
-//     (no `call` inside); no push/pop parity to preserve.
+//   - `tty_reset`, `tty_write_bytes`, `tty_write_byte` are all
+//     leaf functions (no `call` inside); no push/pop parity to
+//     preserve.
 //   - Byte-write to sink uses `mov_b [r10], rax` after computing
 //     `r10 = tty_out_buf + cursor` via `lea + add` — avoids the
 //     `[base + reg]` byte-scale addressing form that has no
@@ -65,19 +72,23 @@ module TtySink = structure {
   pub let TTY_SINK_OVERFLOW  : u64 = 0xFFFFFFF4
 
   // ============================================================================
-  // Sink capacity — 4 KiB. Fits `cmp reg, imm ≤ 0x7FFFFFFF` trivially.
+  // Sink capacity — 64 KiB. Fits `cmp reg, imm ≤ 0x7FFFFFFF` trivially.
+  // M2 widens from M1's 4 KiB so the 64 KiB chunk-buffer streaming
+  // path + the render inflation (line-numbering prefix + -A escapes)
+  // can be exercised end-to-end from the M4 test harness without
+  // exhausting the sink on the first chunk.
   // ============================================================================
-  pub let TTY_OUT_CAP : u64 = 4096
+  pub let TTY_OUT_CAP : u64 = 65536
 
   // ============================================================================
   // Singleton storage (bootstrap-scope; M4 migrates to caller-owned)
   // ============================================================================
 
-  // Sink buffer + cursor. M2 replaces this pair with a
+  // Sink buffer + cursor. shell.M4 replaces this pair with a
   // KIND_TTY(write) syscall wrapper — the syscall accumulates the
   // same "bytes written" statistic but drops the local buffer.
-  pub let mut tty_out_buf : [u8; 4096] = uninit @align(8)
-  pub let mut tty_out_len : u64        = uninit @align(8)
+  pub let mut tty_out_buf : [u8; 65536] = uninit @align(8)
+  pub let mut tty_out_len : u64         = uninit @align(8)
 
   // ============================================================================
   // tty_reset()
@@ -130,7 +141,7 @@ module TtySink = structure {
   pub let tty_write_bytes : (u64, u64) -> u64 !{mem} @{} =
     fn (buf: u64) (len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-003 tty_write_bytes. Copies rsi bytes from rdi into tty_out_buf starting at tty_out_len. Per-byte copy loop: src cursor r9 walks toward r8 = rdi + rsi; sink cursor rcx walks toward TTY_OUT_CAP = 4096; each iteration recomputes the sink write address r10 = tty_out_buf + rcx via lea + add (avoids [base + reg] byte-scale addressing — same idiom as doc's DocRenderer::render_section). Byte reads use xor rax,rax + mov_b (#1248). All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (4096 largest). Empty write (rsi == 0) succeeds with rc = 0 and no cursor advance. Overflow: loop stops, tty_out_len set to the partial-write cursor, return TTY_SINK_OVERFLOW. Leaf function; no callee-save touched.",
+      justification: "cat.M1-003 tty_write_bytes. Copies rsi bytes from rdi into tty_out_buf starting at tty_out_len. Per-byte copy loop: src cursor r9 walks toward r8 = rdi + rsi; sink cursor rcx walks toward TTY_OUT_CAP = 65536; each iteration recomputes the sink write address r10 = tty_out_buf + rcx via lea + add (avoids [base + reg] byte-scale addressing — same idiom as doc's DocRenderer::render_section). Byte reads use xor rax,rax + mov_b (#1248). All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest). Empty write (rsi == 0) succeeds with rc = 0 and no cursor advance. Overflow: loop stops, tty_out_len set to the partial-write cursor, return TTY_SINK_OVERFLOW. Leaf function; no callee-save touched. M2-001..M2-004 raise TTY_OUT_CAP from 4096 to 65536 so the streaming path + render inflation can be exercised end-to-end.",
       block: {
         // ---- Prep loop bounds ------------------------------------------
         mov r9, rdi;                    // r9 = src walking cursor
@@ -154,7 +165,7 @@ module TtySink = structure {
         jge tty_write_ok_done;
 
         // Overflow guard: sink cursor at cap → refuse further writes.
-        cmp rcx, 4096;                  // TTY_OUT_CAP
+        cmp rcx, 65536;                 // TTY_OUT_CAP
         jge tty_write_overflow;
 
         // Load src byte.
@@ -183,6 +194,63 @@ module TtySink = structure {
         lea r11, [rip + tty_out_len];
         mov [r11], rcx;
 
+        mov rax, 0xFFFFFFF4;            // TTY_SINK_OVERFLOW
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tty_write_byte(byte) -> rc
+  //
+  // Signature: tty_write_byte : (u64) -> u64 !{mem} @{}
+  //   RDI: byte value in low 8 bits (upper bits ignored via mov_b)
+  //   RAX: TTY_OK on success, TTY_SINK_OVERFLOW if the sink cap
+  //        would be exceeded.
+  //
+  // M2-002 helper. Render::render_write_bytes calls this per
+  // emitted output byte for the -n line-number prefix (each padded
+  // digit + the trailing '\t') and for the -A escapes (`^X`, `$`,
+  // `M-` prefixes). Using a tight single-byte helper avoids
+  // fabricating a stack-local one-byte buffer at every call site.
+  // The shell.M4 patch that replaces `tty_write_bytes`'s sink
+  // store with a KIND_TTY(write) syscall will apply identically
+  // here (a one-byte syscall arg).
+  //
+  // Leaf function (no `call` inside); no push/pop parity.
+  //
+  // Register plan (leaf; no external call):
+  //   rcx = sink write cursor (byte index; starts at tty_out_len)
+  //   r10 = &tty_out_buf + rcx
+  //   r11 = scratch (paideia-as reserved) — reloaded before every
+  //         `.bss` read/write
+  //   rax = byte value copy / return
+  // ============================================================================
+  pub let tty_write_byte : (u64) -> u64 !{mem} @{} =
+    fn (byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-002 tty_write_byte. Single-byte write into tty_out_buf at tty_out_len. Load current cursor via lea + mov; overflow guard `cmp rcx, 65536; jge tty_write_byte_overflow`; compute dst = tty_out_buf + rcx via lea + add (avoids [base + reg] byte-scale addressing); mov_b [r10], rdi writes the low 8 bits of the byte argument. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest). Leaf function; r11 scratch; xor rax,rax for the OK path return. Overflow persists the (unchanged) cursor and returns TTY_SINK_OVERFLOW. Symmetric shape to tty_write_bytes so the shell.M4 patch that swaps the sink store for sys_kind_tty_write applies identically here.",
+      block: {
+        // Load current sink cursor.
+        lea r11, [rip + tty_out_len];
+        mov rcx, [r11];
+
+        // Overflow guard.
+        cmp rcx, 65536;                 // TTY_OUT_CAP
+        jge tty_write_byte_overflow;
+
+        // Compute dst = tty_out_buf + rcx and write the low byte of rdi.
+        lea r10, [rip + tty_out_buf];
+        add r10, rcx;
+        mov_b [r10], rdi;
+
+        add rcx, 1;                     // cursor++
+        lea r11, [rip + tty_out_len];
+        mov [r11], rcx;
+
+        xor rax, rax;                   // TTY_OK
+        ret
+
+      tty_write_byte_overflow:
         mov rax, 0xFFFFFFF4;            // TTY_SINK_OVERFLOW
         ret
       }

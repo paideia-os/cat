@@ -1,91 +1,403 @@
-// src/file_read.pdx — cat.M1-003
-// FileRead module: file read stub returning (buf_ptr, buf_len).
+// src/file_read.pdx — cat.M2-001 + cat.M2-003
+// FileRead module: streaming per-file source with 64 KiB chunk cap.
 //
-// M1 exposes `file_read_stub()` returning 0 in rax unconditionally.
-// The M1-001 inline stub in src/argv_dispatch.pdx is removed at
-// this milestone and re-hosted here so downstream milestones (M2)
-// can replace this module's body without touching CatDispatch.
+// M2 replaces the M1-003 `file_read_stub()` single-blob shape with
+// a streaming open→read-chunk→close API so `cat_dispatch` can
+// concatenate any number of files (M2-001) without holding the
+// entire content of any one of them in memory (M2-003). The M1 stub
+// symbol is removed; the M1 dispatch call site is rewritten to
+// drive the new API from `cat_dispatch` (`src/argv_dispatch.pdx`).
+//
+// R42-substrate note (per r49-r50-plan.md §2.4 + §5.0)
+// ----------------------------------------------------
+// `KIND_PDXFS_FILE` still is not landed in the kernel at HEAD
+// (2026-08-21). The M2 open/read/close bodies here are a
+// test-seedable stub: `file_read_seed_push(buf, len)` pre-loads N
+// canned sources into a small table; `file_open(path_ptr)` returns
+// a 1-based handle drawn in FIFO order from the table (ignoring the
+// path — the path-to-source binding is what R42's `sys_pdxfs_open`
+// will provide); `file_read_chunk(handle, dst, cap)` streams the
+// seeded source in ≤ cap-byte chunks; `file_close` is a no-op.
+// With an unseeded table `file_open` returns 0 (file not found →
+// exit 4 per I4).
+//
+// The API signatures (see `Contract` below) are the same signatures
+// the R42-landed replacement will expose: at R42 the four function
+// bodies flip to `sys_pdxfs_open` / `sys_pdxfs_read` / `sys_pdxfs_
+// close` wrappers via libpdx-cap; the seed table is deleted. No
+// caller (`cat_dispatch` or `Render::render_write_bytes`) sees the
+// swap — the streaming shape they consume is invariant across the
+// M2-stub → R42-real migration.
+//
+// Handle indexing convention
+// --------------------------
+// Seed-table arrays are sized SEED_MAX + 1 = 9 slots so that slot
+// index 0 is a reserved "invalid handle" sentinel. `file_open`
+// returns handles in the range 1..SEED_MAX, and `file_read_chunk`
+// uses the handle directly as the array subscript — no need to
+// compute `handle - 1` (which would require either a negative
+// immediate in `add reg, imm` or a `sub reg, imm` mnemonic; both
+// are off-limits in this tree's paideia-as subset). The wasted
+// slot-0 storage is ~24 bytes across three arrays — trivial
+// against the 64 KiB `fr_chunk_buf`.
 //
 // Contract
 // --------
-//   file_read_stub : () -> u64 !{mem} @{}
-//     RAX:                  0 → file not found (caller returns exit 4)
-//                         !=0 (M2+) → pointer to a caller-visible
-//                             byte buffer holding the file's contents
-//     file_src_len (.bss): 0 → nothing read (M1 stub)
-//                          bytes-read (M2+)
+//   file_read_reset : () -> () !{mem} @{}
+//     Zero fr_seed_count + fr_next_handle. Called once by
+//     `cat_dispatch` before parsing argv so a fresh invocation
+//     starts from a known baseline.
 //
-// The caller reads (rax, file_src_len) as (ptr, len). M2 replaces
-// the body with a `KIND_PDXFS_FILE(read)` syscall wrapper via
-// libpdx-cap; the return contract is preserved so the M2 edit is
-// body-only inside this function.
+//   file_read_seed_push : (u64, u64) -> u64 !{mem} @{}
+//     RDI: buf ptr
+//     RSI: byte count
+//     RAX: 0 on OK, 1 if SEED_MAX reached
+//     M2-stub-only. Pushes a (buf, len) row into the seed table.
+//     Consumed by `file_open` in FIFO order. R42 deletes this call.
 //
-// Blocked at M1 on
-// ----------------
-//   * R42 substrate — `KIND_PDXFS_FILE` does not exist in the
-//     kernel at HEAD (2026-08-21) per r49-r50-plan.md §2.4.
-//   * libpdx-cap M2 — the userspace-side narrow-cap syscall
-//     wrapper that will host the actual `sys_pdxfs_read` call.
+//   file_open : (u64) -> u64 !{mem} @{}
+//     RDI: path ptr (NUL-term; ignored at M2 — R42 uses it)
+//     RAX: handle (1..SEED_MAX) on OK, 0 on "no more seeds" (M2)
+//          / "path not found or cap denied" (R42).
+//
+//   file_read_chunk : (u64, u64, u64) -> u64 !{mem} @{}
+//     RDI: handle (1..SEED_MAX; 0 or out-of-range → 0)
+//     RSI: dst ptr
+//     RDX: dst cap (max bytes to copy; capped at CHUNK_MAX below)
+//     RAX: bytes actually copied (0 = EOF or handle-invalid)
+//
+//   file_close : (u64) -> u64 !{mem} @{}
+//     RDI: handle
+//     RAX: 0 (M2 no-op; R42 releases kernel handle)
+//
+// Shared chunk buffer
+// -------------------
+//   chunk_buf : [u8; 65536] — shared streaming staging area. Owned
+//   by this module and consumed by BOTH `file_read_chunk`
+//   destinations AND `stdin_source::stdin_read_chunk` destinations.
+//   The M4 test harness `lea`s the buffer to pass as the dst arg.
+//   Sharing across the two sources is safe because M2 is not
+//   re-entrant — `cat_dispatch` drives sources sequentially.
 //
 // paideia-as compliance
 // ---------------------
 //   - Module name PascalCase basename (`FileRead`), no directory
 //     prefix.
 //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
-//   - r11 scratch (paideia-as reserved).
-//   - file_src_len `.bss` slot is 8-byte aligned per `@align(8)`.
-//   - `file_read_stub` is a leaf function (no `call` inside); no
-//     push/pop parity to preserve.
-//
-// Cross-module symbol visibility
-// ------------------------------
-// `file_src_len` is referenced from `CatDispatch::cat_dispatch` by
-// unqualified linker name (`lea r11, [rip + file_src_len]`). Same
-// symbol-resolution pattern doc's DocDispatch uses when reading
-// PdxdocParser::section_count et al.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     65536 for CHUNK_MAX).
+//   - r11 scratch (paideia-as reserved); reloaded before every
+//     `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - No `sub reg, reg` and no negative `add reg, imm` — the
+//     1-indexed handle convention above sidesteps both.
+//   - `file_read_reset`, `file_read_seed_push`, `file_open`,
+//     `file_close` are leaf functions. `file_read_chunk`
+//     preserves r12 via a single push/pop pair (rsp %16 == 0 at
+//     every hypothetical nested call site; the function is a leaf
+//     at M2 but the push keeps the layout ready for the R42 body
+//     which may syscall).
 
 module FileRead = structure {
 
   // ============================================================================
-  // Singleton .bss (bootstrap-scope; M4 migrates to caller-owned)
+  // Constants
   // ============================================================================
 
-  // Byte length of the buffer returned by file_read_stub. Companion
-  // to file_read_stub's rax return: the caller reads (rax,
-  // file_src_len) as a (ptr, len) pair. Zero at M1 (stub always
-  // returns "not found"); the real byte-count after M2's
-  // KIND_PDXFS_FILE(read) call lands.
-  pub let mut file_src_len : u64 = uninit @align(8)
+  // Max chunk size the streaming path emits per file_read_chunk
+  // call. 64 KiB per r49-r50-plan.md §5.5 M2-003.
+  pub let CHUNK_MAX : u64 = 65536
+
+  // Seed-table capacity. Matches CatDispatch::POS_MAX = 8 (max
+  // positional file arguments per invocation). R42 deletes the
+  // seed table entirely.
+  pub let SEED_MAX : u64 = 8
 
   // ============================================================================
-  // file_read_stub() -> src_ptr_or_zero
-  //
-  // Signature: file_read_stub : () -> u64 !{mem} @{}
-  //   RAX (output): 0 (M1) — file not found. M2+ returns a
-  //                 non-zero buffer pointer to a caller-visible
-  //                 read-buffer holding the file's contents.
-  //
-  // Also writes file_src_len:
-  //   M1: 0 (nothing read)
-  //   M2+: byte count returned by the underlying KIND_PDXFS_FILE
-  //        (read) syscall.
-  //
-  // Leaf function; no push/pop parity.
-  //
-  // The return contract (rax = ptr-or-0; file_src_len = byte-count-
-  // or-0) is deliberate: the M2 body-only edit replaces the two
-  // stores below with the syscall wrapper and preserves the two
-  // observables so callers do not change.
+  // Return codes
   // ============================================================================
-  pub let file_read_stub : () -> u64 !{mem} @{} =
+  pub let FR_OK              : u64 = 0
+  pub let FR_ERR_SEED_FULL   : u64 = 1
+
+  // ============================================================================
+  // Shared streaming staging buffer. Consumed by both file_read_chunk
+  // and stdin_source::stdin_read_chunk destinations; caller drives the
+  // dst arg via `lea`. Symbol prefixed `fr_` to avoid unqualified-name
+  // collisions with the other R50 coreutils that will also declare
+  // 64 KiB chunk buffers (mirrors the R48 vello↔vrr vrc_→vrenc_
+  // rename policy).
+  // ============================================================================
+  pub let mut fr_chunk_buf : [u8; 65536] = uninit @align(8)
+
+  // ============================================================================
+  // Seed table (M2-stub only; R42 deletes)
+  //
+  // Arrays sized SEED_MAX + 1 = 9 slots. Slot 0 is a reserved
+  // "invalid handle" sentinel — file_open never returns 0 for a
+  // valid slot, and file_read_chunk indexes with handle directly
+  // so no `handle - 1` arithmetic is required.
+  //
+  // All .bss slot names prefixed `fr_` (see fr_chunk_buf above).
+  // ============================================================================
+  pub let mut fr_seed_bufs      : [u64; 9] = uninit @align(8)
+  pub let mut fr_seed_lens      : [u64; 9] = uninit @align(8)
+  pub let mut fr_seed_cursors   : [u64; 9] = uninit @align(8)  // bytes already read per handle
+  pub let mut fr_seed_count     : u64      = uninit @align(8)  // number of seeds pushed (0..SEED_MAX)
+  pub let mut fr_next_handle    : u64      = uninit @align(8)  // last handle issued (0..SEED_MAX); next issue = fr_next_handle + 1
+
+  // ============================================================================
+  // file_read_reset()
+  //
+  // Signature: file_read_reset : () -> () !{mem} @{}
+  //
+  // Zero fr_seed_count + fr_next_handle. Per-slot cursors past
+  // fr_seed_count are unreachable; the M4 harness re-seeds after
+  // every reset.
+  //
+  // Leaf function; r11 scratch; no push/pop parity to preserve.
+  // ============================================================================
+  pub let file_read_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-003 file_read_stub. Returns 0 in rax and writes 0 into file_src_len — the correct behaviour until R42 substrate (KIND_PDXFS_FILE) lands per r49-r50-plan.md §2.4. Callers reading (rax, file_src_len) as (ptr, len) see a coherent 'not found' pair. Leaf function; r11 scratch for the .bss lea. M2 replaces this body with a KIND_PDXFS_FILE(read) syscall wrapped by libpdx-cap; the (ptr, len) return shape is preserved so the M2 edit does not touch cat_dispatch.",
+      justification: "cat.M2-001 file_read_reset. Zero fr_seed_count + fr_next_handle so a fresh dispatch starts from a clean seed baseline. Per-slot cursors past fr_seed_count are unreachable; the M4 test harness re-seeds via file_read_seed_push after the reset. Leaf function; r11 scratch. R42 deletes this together with the whole seed table.",
       block: {
         xor rax, rax;
-        lea r11, [rip + file_src_len];
+        lea r11, [rip + fr_seed_count];   mov [r11], rax;
+        lea r11, [rip + fr_next_handle];  mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_read_seed_push(buf, len) -> rc
+  //
+  // Signature: file_read_seed_push : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: buf ptr
+  //   RSI: byte count
+  //   RAX: FR_OK (0) on push, FR_ERR_SEED_FULL (1) on overflow
+  //
+  // Appends (buf, len) at slot (fr_seed_count + 1) — remember slot 0
+  // is reserved — and zeroes the per-slot cursor at that slot.
+  // Then increments fr_seed_count.
+  //
+  // Leaf function; r11 scratch.
+  //
+  // Register plan (leaf):
+  //   rax = fr_seed_count / new slot index / return
+  //   rcx = zero constant for cursor init
+  //   r8  = new slot index (fr_seed_count + 1)
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let file_read_seed_push : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-001 file_read_seed_push. M4 test harness helper: appends (buf, len) at slot (fr_seed_count + 1) — slot 0 is reserved as the 'invalid handle' sentinel — and zeroes fr_seed_cursors at that slot so the next file_read_chunk on that handle starts at offset 0. `cmp rax, 8` guards SEED_MAX (well ≤ 0x7FFFFFFF). Leaf function; r11 for lea; rax as scratch. Returns FR_ERR_SEED_FULL past SEED_MAX so callers can push in a loop without bracketing every call. R42 deletes this together with the whole seed table.",
+      block: {
+        lea r11, [rip + fr_seed_count];
+        mov rax, [r11];
+        cmp rax, 8;                    // SEED_MAX
+        jge seed_push_full;
+
+        // r8 = new slot index = fr_seed_count + 1
+        mov r8, rax;
+        add r8, 1;
+
+        lea r11, [rip + fr_seed_bufs];
+        mov [r11 + r8*8], rdi;
+        lea r11, [rip + fr_seed_lens];
+        mov [r11 + r8*8], rsi;
+
+        // Zero the per-slot cursor.
+        xor rcx, rcx;
+        lea r11, [rip + fr_seed_cursors];
+        mov [r11 + r8*8], rcx;
+
+        // Bump fr_seed_count.
+        add rax, 1;
+        lea r11, [rip + fr_seed_count];
         mov [r11], rax;
-        xor rax, rax;                   // 0 → not found
+
+        xor rax, rax;                  // FR_OK
+        ret
+
+      seed_push_full:
+        mov rax, 1;                    // FR_ERR_SEED_FULL
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_open(path_ptr) -> handle
+  //
+  // Signature: file_open : (u64) -> u64 !{mem} @{}
+  //   RDI: path ptr (NUL-terminated; IGNORED at M2 — R42 uses it)
+  //   RAX: handle (1..SEED_MAX) on OK, 0 on "no more seeds" / R42
+  //        "path not found or cap denied"
+  //
+  // M2-stub behaviour: draws the next handle from the seed table
+  // in FIFO order. `file_open` computes `candidate = fr_next_handle +
+  // 1`; if candidate > fr_seed_count then no more seeds → return 0.
+  // Otherwise persists candidate into fr_next_handle and returns it.
+  //
+  // R42 body replaces this with a `sys_pdxfs_open(rdi)` wrapper
+  // through libpdx-cap; the (0 = fail, non-zero = handle) return
+  // contract is preserved so cat_dispatch does not change.
+  //
+  // Leaf function; r11 scratch.
+  // ============================================================================
+  pub let file_open : (u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-001 file_open. M2-stub: draws next handle from seed table in FIFO order. `candidate = fr_next_handle + 1`; if candidate > fr_seed_count then no more seeds → return 0 (matches R42 'not found or cap denied' shape so cat_dispatch's exit-4 arm is invariant). Else persists candidate into fr_next_handle and returns it as a 1-based handle (slot 0 is the reserved invalid sentinel). The path_ptr in rdi is ignored — R42 will consume it. Leaf function; r11 scratch; rax as return.",
+      block: {
+        lea r11, [rip + fr_next_handle];
+        mov rax, [r11];                // rax = fr_next_handle (last issued handle)
+
+        // candidate = fr_next_handle + 1
+        add rax, 1;
+
+        lea r11, [rip + fr_seed_count];
+        mov rcx, [r11];
+        cmp rax, rcx;
+        jg file_open_none;             // candidate > fr_seed_count → none
+
+        // Persist candidate.
+        lea r11, [rip + fr_next_handle];
+        mov [r11], rax;
+        ret                             // rax = new handle
+
+      file_open_none:
+        xor rax, rax;                  // 0 = no more seeds / not found
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_read_chunk(handle, dst, cap) -> bytes
+  //
+  // Signature: file_read_chunk : (u64, u64, u64) -> u64 !{mem} @{}
+  //   RDI: handle (1..SEED_MAX; 0 or > fr_seed_count → 0)
+  //   RSI: dst ptr
+  //   RDX: dst cap (max bytes; capped at CHUNK_MAX below)
+  //   RAX: bytes copied (0 = EOF or bad handle)
+  //
+  // Streams up to min(cap, CHUNK_MAX, remaining) bytes from
+  // fr_seed_bufs[handle] + fr_seed_cursors[handle] into [dst, dst +
+  // bytes). Advances fr_seed_cursors[handle] by bytes. Zero return
+  // means EOF (all bytes consumed) OR bad handle — cat_dispatch
+  // treats zero uniformly as EOF and exits the per-file loop.
+  //
+  // R42 body replaces this with a `sys_pdxfs_read(rdi, rsi, rdx)`
+  // wrapper through libpdx-cap; the byte-count return contract is
+  // preserved.
+  //
+  // Register plan (single-push callee-save prologue: r12):
+  //   r8  = handle             (0 < handle ≤ SEED_MAX)
+  //   r9  = fr_seed_bufs[handle]  (base of seeded source)
+  //   r10 = fr_seed_cursors[handle] (bytes already read from this handle)
+  //   r12 = fr_seed_lens[handle]  (total; callee-save preserved)
+  //   rcx = bytes copied so far this call (running count)
+  //   rax = byte load / return
+  //   rdi = dst walking cursor (starts at rsi = dst base)
+  //   rsi = dst base (input arg2; not walked directly)
+  //   rdx = dst cap (input arg3; upper bound in the per-iter check)
+  //   r11 = lea scratch (paideia-as reserved)
+  //
+  // rsp arithmetic: entry rsp%16 == 8 (caller CALL). `push r12` →
+  // rsp%16 == 0 for any hypothetical nested call site (M2 is a
+  // leaf but the layout is ready for R42's syscall body). Every
+  // `ret` mirrors with `pop r12`.
+  // ============================================================================
+  pub let file_read_chunk : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (handle: u64) (dst: u64) (cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-003 file_read_chunk. M2-stub streaming read: per-iter min(cap, CHUNK_MAX, remaining) enforced by three cmp+jge guards inside the copy loop (`cmp rcx, 65536`, `cmp rcx, rdx`, `cmp r10, r12`) rather than a pre-loop `bytes = min(...)` computation (which would need `sub reg, reg` to compute `remaining = total - cursor` and paideia-as bans that mnemonic). Handle validity: rdi == 0 → EOF; rdi > fr_seed_count → EOF. Slot-0-reserved indexing convention means `[base + rdi*8]` addresses fr_seed_bufs[handle] directly with no `handle - 1` arithmetic. `push r12` preserves the callee-save reg holding fr_seed_lens[handle]; the pre-guard cmp against fr_seed_count uses rax scratch before the push so nothing is clobbered under the push. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (65536 largest). Src byte load via `xor rax,rax; mov_b rax, [r11]` (#1248) after `lea r11, [r9 + r10*1]`. Dst byte write to caller-owned buffer via `lea r11, [rdi + rcx*1]; mov_b [r11], rax`. Advances fr_seed_cursors[handle] by bytes-copied on success. Single push/pop pair (rsp%16 == 0 at any nested call site; ready for R42 syscall body).",
+      block: {
+        // ---- Handle validity gate (before push, so ret is bare) --------
+        cmp rdi, 0;
+        je fr_chunk_eof_bare;
+
+        lea r11, [rip + fr_seed_count];
+        mov rax, [r11];
+        cmp rdi, rax;
+        jg fr_chunk_eof_bare;          // handle > fr_seed_count → EOF
+
+        // ---- Prologue: preserve r12 -----------------------------------
+        push r12;
+
+        mov r8, rdi;                   // r8 = handle (kept live for cursor store)
+
+        // ---- Load per-handle state (indexed with handle directly) -----
+        lea r11, [rip + fr_seed_bufs];
+        mov r9,  [r11 + r8*8];         // r9  = source base
+        lea r11, [rip + fr_seed_cursors];
+        mov r10, [r11 + r8*8];         // r10 = current cursor
+        lea r11, [rip + fr_seed_lens];
+        mov r12, [r11 + r8*8];         // r12 = total len
+
+        // rdi = dst walking cursor. rsi holds the caller's dst base;
+        // walk via rdi, aliased to rsi at start.
+        mov rdi, rsi;
+
+        // rcx = bytes-copied running count.
+        xor rcx, rcx;
+
+      fr_chunk_copy_head:
+        // Guard 1: rcx < CHUNK_MAX
+        cmp rcx, 65536;                // CHUNK_MAX
+        jge fr_chunk_copy_done;
+        // Guard 2: rcx < caller cap (rdx)
+        cmp rcx, rdx;
+        jge fr_chunk_copy_done;
+        // Guard 3: r10 < total (r12)
+        cmp r10, r12;
+        jge fr_chunk_copy_done;
+
+        // src byte at fr_seed_bufs[handle] + cursor
+        lea r11, [r9 + r10*1];         // r11 = &src[cursor]
+        xor rax, rax;
+        mov_b rax, [r11];
+
+        // dst byte at dst_base + bytes-copied (caller-owned; direct)
+        lea r11, [rdi + rcx*1];
+        mov_b [r11], rax;
+
+        add r10, 1;                    // cursor++
+        add rcx, 1;                    // bytes-copied++
+        jmp fr_chunk_copy_head;
+
+      fr_chunk_copy_done:
+        // Persist updated cursor into fr_seed_cursors[handle].
+        lea r11, [rip + fr_seed_cursors];
+        mov [r11 + r8*8], r10;
+
+        mov rax, rcx;                  // rax = bytes copied
+        pop r12;
+        ret
+
+      fr_chunk_eof_bare:
+        xor rax, rax;                  // 0 = EOF / bad handle
+        ret
+      }
+    }
+
+  // ============================================================================
+  // file_close(handle) -> rc
+  //
+  // Signature: file_close : (u64) -> u64 !{mem} @{}
+  //   RDI: handle (ignored at M2)
+  //   RAX: 0 (M2 no-op; R42 releases kernel handle via sys_pdxfs_close)
+  //
+  // Leaf function; no side effect at M2. The M2 stub does not
+  // deallocate seed table entries — the M4 test harness re-runs
+  // file_read_reset between test cases.
+  // ============================================================================
+  pub let file_close : (u64) -> u64 !{mem} @{} =
+    fn (handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-001 file_close. M2 no-op: R42 will replace the body with sys_pdxfs_close(rdi) via libpdx-cap. The M2 stub does not deallocate seed table entries — cat_dispatch re-runs file_read_reset between invocations. Leaf function; xor rax,rax returns 0 (success).",
+      block: {
+        xor rax, rax;
         ret
       }
     }

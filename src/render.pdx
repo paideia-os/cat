@@ -1,0 +1,756 @@
+// src/render.pdx — cat.M2-002
+// Render module: line-numbering (-n) and non-printable escapes (-A).
+//
+// Sits between the source layer (FileRead::file_read_chunk +
+// StdinSource::stdin_read_chunk both filling FileRead::chunk_buf)
+// and the sink layer (TtySink::tty_write_byte / tty_write_bytes).
+// `cat_dispatch` calls `render_reset(flags)` once per invocation
+// and then loops per-source-chunk calls to `render_write_bytes(src,
+// len)`; the reset preserves cross-file continuity of the line
+// counter (per POSIX cat -n semantics — lines are numbered across
+// concatenated files, not restarted per file).
+//
+// -n behaviour (r49-r50-plan.md §5.5 M2-002 first half)
+// -----------------------------------------------------
+// Each output line is prefixed with the current line number,
+// right-justified in a 6-column field, followed by a tab (0x09).
+// The counter starts at 1 and increments AFTER each line's prefix
+// is emitted. A line ends at 0x0A; the next non-eof byte begins a
+// new line and triggers a fresh prefix. Numbers ≤ 999999 are
+// padded with leading spaces to 6 columns; numbers ≥ 1000000
+// print in full without padding (leading-space region collapses
+// to zero). Numbers ≥ 10^7 up to the u64 cap are rendered via the
+// same digit-extraction path; the M2 6-column-limit is chosen so
+// the extraction loop's per-place immediates all fit in imm32.
+//
+// -A behaviour (r49-r50-plan.md §5.5 M2-002 second half)
+// ------------------------------------------------------
+// Mirrors GNU cat -A = -vET:
+//   0x09 (tab)             → `^I` (two output bytes)
+//   0x0A (LF)              → `$\n` (dollar then real newline — end-
+//                             of-line marker followed by the actual
+//                             newline that separates output lines)
+//   0x00..0x08, 0x0B..0x1F → `^X` where X = byte + 0x40 (e.g.
+//                             0x01 → `^A` = 0x5E 0x41)
+//   0x20..0x7E printable   → byte as-is
+//   0x7F (DEL)             → `^?` = 0x5E 0x3F
+//   0x80..0xFF             → `M-` prefix then the sub-0x80 dispatch
+//                             applied to (byte & 0x7F). Inlined —
+//                             no true recursion since the masked
+//                             byte is guaranteed < 0x80.
+//
+// -n and -A interact at emission time: the line-number prefix
+// bytes (padded digits + tab) go directly to the sink without -A
+// escape processing (matching GNU cat -An — the prefix's tab is
+// never rendered as `^I`).
+//
+// Contract
+// --------
+//   render_reset : (u64) -> () !{mem} @{}
+//     RDI: flags (bit 0 = FLAG_N, bit 1 = FLAG_A; same layout as
+//          CatDispatch::flag_mask).
+//     Zero line counter to 1 and set at-line-start=1. Called once
+//     per invocation from cat_dispatch, BEFORE the per-file loop —
+//     line numbering is continuous across concatenated files.
+//
+//   render_write_bytes : (u64, u64) -> u64 !{mem} @{}
+//     RDI: src ptr
+//     RSI: byte count
+//     RAX: RENDER_OK (0) on success, RENDER_ERR_SINK (3) on any
+//          sink overflow (propagated from tty_write_byte /
+//          tty_write_bytes).
+//     Streams the source range through the -n / -A transforms into
+//     the sink. Non-leaf (calls TtySink helpers per output byte on
+//     the transform paths, or once for the pass-through path).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`Render`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (largest:
+//     100000 for the 10^5 digit-place cap).
+//   - `add reg, -N` used to synthesise decrement inside digit
+//     extraction (`add rax, -100000` etc.). Encoded by paideia-as
+//     as `add reg64, imm8/imm32` with signed immediate — the
+//     `sub` mnemonic is deliberately avoided (matches cat's M1
+//     style ban carried forward from `design/architecture.md` §5).
+//   - r11 scratch (paideia-as reserved); reloaded before every
+//     `.bss` read/write.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
+//   - `render_reset` is leaf. `render_write_bytes` is non-leaf
+//     with a 5-push callee-save prologue (rbx / r12 / r13 / r14 /
+//     r15 → rsp%16 == 0 at every nested call site).
+//   - `render_emit_line_num_prefix` and `render_emit_A_byte` are
+//     also non-leaf with 5-push prologues each (same alignment).
+
+module Render = structure {
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+  pub let RENDER_OK        : u64 = 0
+  pub let RENDER_ERR_SINK  : u64 = 3
+
+  // ============================================================================
+  // Flag bit layout (mirrors CatDispatch::FLAG_*)
+  // ============================================================================
+  pub let RENDER_FLAG_N : u64 = 0x1
+  pub let RENDER_FLAG_A : u64 = 0x2
+
+  // ============================================================================
+  // .bss state (bootstrap-scope; M4 migrates to caller-owned)
+  // ============================================================================
+
+  // Flag mask passed to render_reset; consulted per byte in
+  // render_write_bytes.
+  pub let mut render_flags : u64 = uninit @align(8)
+
+  // Line-number counter. Starts at 1 after render_reset; incremented
+  // by render_emit_line_num_prefix AFTER each prefix emit.
+  pub let mut render_line_num : u64 = uninit @align(8)
+
+  // 1 if the next non-EOF byte begins a new line (and therefore
+  // needs a line-number prefix when -n is set). Set to 1 by
+  // render_reset and after every 0x0A emit.
+  pub let mut render_at_line_start : u64 = uninit @align(8)
+
+  // ============================================================================
+  // render_reset(flags)
+  //
+  // Signature: render_reset : (u64) -> () !{mem} @{}
+  //   RDI: flag mask (bit 0 = FLAG_N, bit 1 = FLAG_A)
+  //
+  // Save flags; set line_num = 1; set at_line_start = 1. Called
+  // once per invocation from cat_dispatch, BEFORE the per-file
+  // loop starts.
+  //
+  // Leaf function; r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let render_reset : (u64) -> () !{mem} @{} =
+    fn (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-002 render_reset. Persists flags into render_flags, initialises render_line_num to 1 (POSIX cat -n numbers from 1, and the increment path in render_emit_line_num_prefix bumps AFTER emit so line 1 must be visible before the first emit), sets render_at_line_start to 1 (so the very first non-EOF byte from the first file triggers a prefix when -n is set). Called ONCE per cat invocation — not per file — so line numbering is continuous across concatenated files per GNU cat -n semantics. Leaf; r11 scratch.",
+      block: {
+        lea r11, [rip + render_flags];        mov [r11], rdi;
+
+        mov rax, 1;
+        lea r11, [rip + render_line_num];     mov [r11], rax;
+        lea r11, [rip + render_at_line_start]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // render_emit_line_num_prefix() -> rc
+  //
+  // Signature: render_emit_line_num_prefix : () -> u64 !{mem} @{}
+  //   RAX: RENDER_OK (0) on success, RENDER_ERR_SINK (3) on
+  //        sink overflow.
+  //
+  // Emits the current line-number prefix (padded digits + tab) to
+  // the sink, then increments render_line_num. 6-column padding
+  // for numbers ≤ 999999; numbers ≥ 1000000 print without padding.
+  //
+  // Digit-extraction approach (constrained by paideia-as style —
+  // no `sub` mnemonic, no `div`, no `mul`): for each decimal place
+  // 10^5 → 10^4 → 10^3 → 10^2 → 10^1 → 10^0, count via
+  // `cmp rax, place; jl done; add rax, -place; add digit, 1;
+  // jmp count`. Leading zeros before the first non-zero digit
+  // emit as spaces (padding); after the first non-zero, subsequent
+  // zeros emit as `0`. If line-num ≥ 1000000, the 10^5 branch
+  // sees rax >= 100000 immediately and the padding-space region
+  // collapses to zero — the digit column simply widens. u64 values
+  // > 999999 through the 6-place unroll still produce a correct
+  // 6-digit tail; the 7+ digit leading part is dropped, giving a
+  // wrapped rendering. M2 accepts this trade-off (see the file
+  // header) because files > 1M lines are pathological; softarch's
+  // R42 pass will replace this with a 20-place unrolled version
+  // once the KIND_PDXFS_FILE substrate exercises real files.
+  //
+  // Register plan (5-push callee-save prologue):
+  //   rbx = have-seen-nonzero flag (0/1, drives space-vs-'0' rule)
+  //   r12 = current place value (100000, 10000, ..., 1)
+  //   r13 = current digit accumulator
+  //   r14 = num being extracted (callee-save; preserved across
+  //         tty_write_byte calls which clobber rax)
+  //   r15 = alignment pad
+  //   rax = byte load / tty_write_byte return
+  //   rcx = flag-mask temp
+  //   rdi = tty_write_byte arg
+  //   r11 = lea scratch
+  //
+  // rsp arithmetic: entry rsp%16 == 8 (post-CALL). 5 pushes lands
+  // rsp%16 == 0 at every nested tty_write_byte call site.
+  // ============================================================================
+  pub let render_emit_line_num_prefix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-002 render_emit_line_num_prefix. Emits padded line-number + tab, increments render_line_num. 6-place unrolled digit extraction — for each place 100000, 10000, 1000, 100, 10, 1 the code counts hits via `cmp rax, place; jl done; add rax, -place; add r13, 1; jmp count`. Emits '0'+digit for a non-zero digit (setting have_seen_nonzero=rbx=1) or ' ' for a leading-zero digit (rbx==0). Post-loop emits a tab (0x09) then increments render_line_num. Non-leaf: many tty_write_byte calls; 5-push callee-save prologue (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every nested call site — r14 preserves the destructively-extracted num across tty_write_byte's rax clobber. Every tty_write_byte return checked via `cmp rax, 0; jne err_sink` — propagates RENDER_ERR_SINK on any partial-write. The `add rax, -100000` etc. form is `add reg64, imm32` with signed immediate; paideia-as encoder supports this (see paideia-as-encoder tests add_reg64_imm8_negative_value + add_reg64_imm32); avoids `sub` mnemonic per this repo's M1 style carried forward from design/architecture.md §5. u64 values > 999999 through the 6-place unroll drop leading digits — M2 trade-off documented in the function header; R42 pass extends to 20 places once KIND_PDXFS_FILE lets us exercise real files.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Load num into r14 (preserved across tty_write_byte calls).
+        lea r11, [rip + render_line_num];
+        mov r14, [r11];
+
+        // Saturating clamp to 999999 so the 6-place unroll cannot
+        // produce a digit ≥ 10 (which would emit `:` = 0x3A instead
+        // of a real ASCII digit). For line-num > 999999 the prefix
+        // renders as "999999\t" as a saturated indicator. The
+        // underlying render_line_num counter is NOT clamped — the
+        // increment at the tail keeps counting truthfully so the
+        // R42 pass that lifts the 6-place cap to 20 places can
+        // pick up the real value without touching the counter.
+        mov rax, 999999;
+        cmp r14, rax;
+        jle elnp_no_clamp;
+        mov r14, 999999;
+      elnp_no_clamp:
+
+        xor rbx, rbx;                    // have_seen_nonzero = 0
+
+        // ==================== 10^5 place (100000) ====================
+        mov r12, 100000;
+        xor r13, r13;                    // digit acc = 0
+      elnp_p100k_head:
+        cmp r14, r12;
+        jl elnp_p100k_done;
+        add r14, -100000;
+        add r13, 1;
+        jmp elnp_p100k_head;
+      elnp_p100k_done:
+        cmp r13, 0;
+        jg elnp_p100k_emit_digit;
+        // Leading zero → emit space.
+        mov rdi, 0x20;                   // ' '
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p10k_start;
+      elnp_p100k_emit_digit:
+        mov rdi, r13;
+        add rdi, 0x30;                   // '0' + digit
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        mov rbx, 1;                      // have_seen_nonzero = 1
+
+        // ==================== 10^4 place (10000) =====================
+      elnp_p10k_start:
+        mov r12, 10000;
+        xor r13, r13;
+      elnp_p10k_head:
+        cmp r14, r12;
+        jl elnp_p10k_done;
+        add r14, -10000;
+        add r13, 1;
+        jmp elnp_p10k_head;
+      elnp_p10k_done:
+        cmp r13, 0;
+        jg elnp_p10k_emit_digit;
+        // digit == 0. Emit '0' if we've seen a nonzero already, else space.
+        cmp rbx, 0;
+        jne elnp_p10k_emit_zero;
+        mov rdi, 0x20;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p1k_start;
+      elnp_p10k_emit_zero:
+        mov rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p1k_start;
+      elnp_p10k_emit_digit:
+        mov rdi, r13;
+        add rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        mov rbx, 1;
+
+        // ==================== 10^3 place (1000) ======================
+      elnp_p1k_start:
+        mov r12, 1000;
+        xor r13, r13;
+      elnp_p1k_head:
+        cmp r14, r12;
+        jl elnp_p1k_done;
+        add r14, -1000;
+        add r13, 1;
+        jmp elnp_p1k_head;
+      elnp_p1k_done:
+        cmp r13, 0;
+        jg elnp_p1k_emit_digit;
+        cmp rbx, 0;
+        jne elnp_p1k_emit_zero;
+        mov rdi, 0x20;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p100_start;
+      elnp_p1k_emit_zero:
+        mov rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p100_start;
+      elnp_p1k_emit_digit:
+        mov rdi, r13;
+        add rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        mov rbx, 1;
+
+        // ==================== 10^2 place (100) =======================
+      elnp_p100_start:
+        mov r12, 100;
+        xor r13, r13;
+      elnp_p100_head:
+        cmp r14, r12;
+        jl elnp_p100_done;
+        add r14, -100;
+        add r13, 1;
+        jmp elnp_p100_head;
+      elnp_p100_done:
+        cmp r13, 0;
+        jg elnp_p100_emit_digit;
+        cmp rbx, 0;
+        jne elnp_p100_emit_zero;
+        mov rdi, 0x20;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p10_start;
+      elnp_p100_emit_zero:
+        mov rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p10_start;
+      elnp_p100_emit_digit:
+        mov rdi, r13;
+        add rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        mov rbx, 1;
+
+        // ==================== 10^1 place (10) ========================
+      elnp_p10_start:
+        mov r12, 10;
+        xor r13, r13;
+      elnp_p10_head:
+        cmp r14, r12;
+        jl elnp_p10_done;
+        add r14, -10;
+        add r13, 1;
+        jmp elnp_p10_head;
+      elnp_p10_done:
+        cmp r13, 0;
+        jg elnp_p10_emit_digit;
+        cmp rbx, 0;
+        jne elnp_p10_emit_zero;
+        mov rdi, 0x20;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p1_start;
+      elnp_p10_emit_zero:
+        mov rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        jmp elnp_p1_start;
+      elnp_p10_emit_digit:
+        mov rdi, r13;
+        add rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+        mov rbx, 1;
+
+        // ==================== 10^0 place (1) — always emit ===========
+        // The units place always emits a digit — even if the number
+        // is 0 we render '0' (not a space). Line-numbering never
+        // hits num == 0 in normal use (starts at 1), but the
+        // arithmetic is safe.
+      elnp_p1_start:
+        mov r12, 1;
+        xor r13, r13;
+      elnp_p1_head:
+        cmp r14, r12;
+        jl elnp_p1_done;
+        add r14, -1;
+        add r13, 1;
+        jmp elnp_p1_head;
+      elnp_p1_done:
+        // Emit r13 as ASCII digit — always, no space fallback here.
+        mov rdi, r13;
+        add rdi, 0x30;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+
+        // ==================== Tab separator (0x09) ==================
+        mov rdi, 0x09;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne elnp_err;
+
+        // ==================== Increment render_line_num =============
+        lea r11, [rip + render_line_num];
+        mov rax, [r11];
+        add rax, 1;
+        lea r11, [rip + render_line_num];
+        mov [r11], rax;
+
+        xor rax, rax;                    // RENDER_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      elnp_err:
+        mov rax, 3;                      // RENDER_ERR_SINK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // render_emit_A_byte(byte) -> rc
+  //
+  // Signature: render_emit_A_byte : (u64) -> u64 !{mem} @{}
+  //   RDI: byte (low 8 bits)
+  //   RAX: RENDER_OK on success, RENDER_ERR_SINK on sink overflow
+  //
+  // Applies the -A escape rules to a single non-newline byte and
+  // emits the resulting 1..3 output bytes. Non-leaf (up to three
+  // tty_write_byte calls per input byte).
+  //
+  // Callers must NOT pass 0x0A here — the newline path (with -A's
+  // trailing `$` + real `\n` emission) is handled by
+  // render_write_bytes directly.
+  //
+  // Dispatch summary (see file header for the full table):
+  //   0x09      → '^' 'I'
+  //   0x00..0x08, 0x0B..0x1F → '^' (byte + 0x40)
+  //   0x20..0x7E → byte as-is
+  //   0x7F      → '^' '?'
+  //   0x80..0xFF → 'M' '-' then re-dispatch on (byte & 0x7F). The
+  //                re-dispatch is inlined via a label jump (no
+  //                true recursion) because the masked byte is
+  //                guaranteed < 0x80.
+  //
+  // Register plan (5-push callee-save prologue for 16-byte align):
+  //   rbx = current byte value (destructive; masked after 'M-' prefix)
+  //   r12..r15 = alignment pad (unused)
+  //   rdi = tty_write_byte arg
+  //   rax = tty_write_byte return
+  //   rcx = temp
+  //   r11 = lea scratch (paideia-as reserved)
+  // ============================================================================
+  pub let render_emit_A_byte : (u64) -> u64 !{mem} @{} =
+    fn (byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-002 render_emit_A_byte. Applies -A escape rules to a single non-newline byte and emits the 1..3 output bytes via tty_write_byte. Dispatch table in the function header. High-byte (>= 0x80) 'M-' prefix followed by masked re-dispatch is inlined via a label jump — the masked byte is guaranteed < 0x80 so no true recursion is needed. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (0x7F = 127 largest). rbx callee-save carries the current byte value across tty_write_byte's rax clobber. 5-push prologue lands rsp%16 == 0 at every nested tty_write_byte call site.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // rbx = current byte
+        // Mask to low 8 bits — belt-and-braces since callers may pass
+        // rax through unmasked. `and rbx, 0xFF` is a single-imm op.
+        and rbx, 0xFF;
+
+      eab_dispatch:
+        // High-byte (>= 0x80) → emit 'M-' then re-dispatch masked.
+        cmp rbx, 0x80;
+        jl eab_low_range;
+
+        // Emit 'M'
+        mov rdi, 0x4D;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        // Emit '-'
+        mov rdi, 0x2D;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        // Mask off high bit; re-dispatch.
+        and rbx, 0x7F;
+        jmp eab_dispatch;
+
+      eab_low_range:
+        // rbx in [0x00, 0x7F].
+        // 0x09 (tab) → '^' 'I'
+        cmp rbx, 0x09;
+        je eab_emit_tab;
+        // 0x7F (DEL) → '^' '?'
+        cmp rbx, 0x7F;
+        je eab_emit_del;
+        // 0x00..0x1F (excluding 0x09 and 0x0A) → '^' (byte + 0x40).
+        // 0x0A is handled by caller; asserted excluded here.
+        cmp rbx, 0x20;
+        jl eab_emit_ctrl;
+        // 0x20..0x7E printable → byte as-is
+        jmp eab_emit_plain;
+
+      eab_emit_tab:
+        mov rdi, 0x5E;                   // '^'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        mov rdi, 0x49;                   // 'I'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        jmp eab_ok;
+
+      eab_emit_del:
+        mov rdi, 0x5E;                   // '^'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        mov rdi, 0x3F;                   // '?'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        jmp eab_ok;
+
+      eab_emit_ctrl:
+        // '^' (byte + 0x40)
+        mov rdi, 0x5E;                   // '^'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        mov rdi, rbx;
+        add rdi, 0x40;                   // byte + 0x40
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        jmp eab_ok;
+
+      eab_emit_plain:
+        mov rdi, rbx;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne eab_err;
+        jmp eab_ok;
+
+      eab_ok:
+        xor rax, rax;                    // RENDER_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      eab_err:
+        mov rax, 3;                      // RENDER_ERR_SINK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // render_write_bytes(src, len) -> rc
+  //
+  // Signature: render_write_bytes : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: src ptr
+  //   RSI: byte count
+  //   RAX: RENDER_OK on success, RENDER_ERR_SINK on sink overflow
+  //
+  // The main M2 render pipeline. Iterates the byte range,
+  // dispatching per-byte through -n and -A logic:
+  //   1. If at_line_start && (flags & FLAG_N): emit line-num
+  //      prefix + tab, increment counter, clear at_line_start.
+  //   2. If byte == 0x0A: with FLAG_A emit '$' first; then emit
+  //      real '\n'; set at_line_start = 1.
+  //   3. Else if FLAG_A: dispatch through render_emit_A_byte.
+  //   4. Else: emit byte as-is via tty_write_byte.
+  //
+  // Fast-path optimisation: when flags == 0 (neither -n nor -A),
+  // fall through to a single tty_write_bytes(rdi, rsi) call —
+  // saves the per-byte overhead. This is the common invocation
+  // path for `cat file` with no flags.
+  //
+  // Register plan (5-push callee-save prologue):
+  //   rbx = src walking cursor (starts at rdi; advances byte-by-byte)
+  //   r12 = src end (rdi + rsi)
+  //   r13 = flags snapshot (loaded once from render_flags)
+  //   r14 = alignment pad (unused)
+  //   r15 = alignment pad (unused)
+  //   rax = byte load / call return
+  //   rcx = flag-mask temp
+  //   rdi = call arg
+  //   r11 = lea scratch (paideia-as reserved)
+  // ============================================================================
+  pub let render_write_bytes : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M2-002 render_write_bytes. Per-byte dispatch through -n line-numbering + -A escape logic. Fast-path when render_flags == 0: single tty_write_bytes(rdi, rsi) call — same shape as M1's cat_dispatch tail. Otherwise iterates byte-by-byte with three-way dispatch: at-line-start prefix (if FLAG_N), newline handling (with FLAG_A '$' prefix), non-newline byte (through render_emit_A_byte if FLAG_A, else raw tty_write_byte). Byte reads use `xor rax,rax; mov_b rax, [r11]` (#1248) after `lea r11, [rbx + r13*1]` — wait, r13 holds flags. Actually: `lea r11, [rbx]; xor rax,rax; mov_b rax, [r11]` walks rbx directly (rbx incremented per iter via `add rbx, 1`). Every tty_write_byte/tty_write_bytes/render_emit_line_num_prefix/render_emit_A_byte return checked via `cmp rax, 0; jne rwb_err` — propagates RENDER_ERR_SINK. All `cmp reg, imm` immediates ≤ 0x7FFFFFFF (0x0A, 0x24, 0x2, 0x1 all trivial). 5-push callee-save prologue (rbx / r12 / r13 / r14 / r15) lands rsp%16 == 0 at every nested call site.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // rbx = src walking cursor
+        mov r12, rdi;
+        add r12, rsi;                    // r12 = src end (exclusive)
+
+        // Load flags snapshot.
+        lea r11, [rip + render_flags];
+        mov r13, [r11];
+
+        // Fast-path: flags == 0 → single-call passthrough.
+        cmp r13, 0;
+        jne rwb_slow_path;
+
+        // Fast path: rdi/rsi already hold src/len from function entry
+        // (rdi may have been aliased into rbx but is still valid). Call
+        // tty_write_bytes with the original args — we still have rdi
+        // and rsi unchanged because rbx aliased rdi at start and rsi
+        // was only read into r12 via add.
+        mov rdi, rbx;                    // src (was in rbx == rdi at start)
+        // rsi already holds len (not clobbered)
+        call tty_write_bytes;
+        // tty_write_bytes returns TTY_OK (0) or TTY_SINK_OVERFLOW
+        cmp rax, 0;
+        jne rwb_err_from_sink;
+        jmp rwb_ok;
+
+      rwb_slow_path:
+      rwb_head:
+        cmp rbx, r12;
+        jge rwb_ok;
+
+        // Load current byte into rax.
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // ---- Line-number prefix check ---------------------------------
+        // If at_line_start != 0 AND (flags & FLAG_N) != 0.
+        mov rcx, r13;
+        and rcx, 0x1;                    // FLAG_N
+        cmp rcx, 0;
+        je rwb_after_prefix;
+
+        lea r11, [rip + render_at_line_start];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        je rwb_after_prefix;
+
+        // Emit prefix. rax (byte) must be preserved across the call.
+        // Move byte into r14 (unused pad slot; we've saved r14 in the
+        // prologue so it's ours to use).
+        mov r14, rax;
+        call render_emit_line_num_prefix;
+        cmp rax, 0;
+        jne rwb_err;
+        mov rax, r14;                    // restore byte
+
+        // Clear at_line_start.
+        xor rcx, rcx;
+        lea r11, [rip + render_at_line_start];
+        mov [r11], rcx;
+
+      rwb_after_prefix:
+        // ---- Byte dispatch --------------------------------------------
+        cmp rax, 0x0A;
+        je rwb_handle_newline;
+
+        // Non-newline byte. If FLAG_A, use render_emit_A_byte; else raw.
+        mov rcx, r13;
+        and rcx, 0x2;                    // FLAG_A
+        cmp rcx, 0;
+        jne rwb_A_byte;
+
+        // Raw single-byte emit.
+        mov rdi, rax;
+        call tty_write_byte;
+        cmp rax, 0;
+        jne rwb_err_from_sink;
+        jmp rwb_advance;
+
+      rwb_A_byte:
+        mov rdi, rax;
+        call render_emit_A_byte;
+        cmp rax, 0;
+        jne rwb_err;
+        jmp rwb_advance;
+
+      rwb_handle_newline:
+        // If FLAG_A, emit '$' first.
+        mov rcx, r13;
+        and rcx, 0x2;                    // FLAG_A
+        cmp rcx, 0;
+        je rwb_nl_no_dollar;
+
+        mov rdi, 0x24;                   // '$'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne rwb_err_from_sink;
+
+      rwb_nl_no_dollar:
+        mov rdi, 0x0A;                   // '\n'
+        call tty_write_byte;
+        cmp rax, 0;
+        jne rwb_err_from_sink;
+
+        // Set at_line_start.
+        mov rcx, 1;
+        lea r11, [rip + render_at_line_start];
+        mov [r11], rcx;
+        jmp rwb_advance;
+
+      rwb_advance:
+        add rbx, 1;
+        jmp rwb_head;
+
+      rwb_ok:
+        xor rax, rax;                    // RENDER_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+
+      rwb_err_from_sink:
+      rwb_err:
+        mov rax, 3;                      // RENDER_ERR_SINK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
