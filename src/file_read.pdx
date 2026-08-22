@@ -1,0 +1,92 @@
+// src/file_read.pdx — cat.M1-003
+// FileRead module: file read stub returning (buf_ptr, buf_len).
+//
+// M1 exposes `file_read_stub()` returning 0 in rax unconditionally.
+// The M1-001 inline stub in src/argv_dispatch.pdx is removed at
+// this milestone and re-hosted here so downstream milestones (M2)
+// can replace this module's body without touching CatDispatch.
+//
+// Contract
+// --------
+//   file_read_stub : () -> u64 !{mem} @{}
+//     RAX:                  0 → file not found (caller returns exit 4)
+//                         !=0 (M2+) → pointer to a caller-visible
+//                             byte buffer holding the file's contents
+//     file_src_len (.bss): 0 → nothing read (M1 stub)
+//                          bytes-read (M2+)
+//
+// The caller reads (rax, file_src_len) as (ptr, len). M2 replaces
+// the body with a `KIND_PDXFS_FILE(read)` syscall wrapper via
+// libpdx-cap; the return contract is preserved so the M2 edit is
+// body-only inside this function.
+//
+// Blocked at M1 on
+// ----------------
+//   * R42 substrate — `KIND_PDXFS_FILE` does not exist in the
+//     kernel at HEAD (2026-08-21) per r49-r50-plan.md §2.4.
+//   * libpdx-cap M2 — the userspace-side narrow-cap syscall
+//     wrapper that will host the actual `sys_pdxfs_read` call.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`FileRead`), no directory
+//     prefix.
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - r11 scratch (paideia-as reserved).
+//   - file_src_len `.bss` slot is 8-byte aligned per `@align(8)`.
+//   - `file_read_stub` is a leaf function (no `call` inside); no
+//     push/pop parity to preserve.
+//
+// Cross-module symbol visibility
+// ------------------------------
+// `file_src_len` is referenced from `CatDispatch::cat_dispatch` by
+// unqualified linker name (`lea r11, [rip + file_src_len]`). Same
+// symbol-resolution pattern doc's DocDispatch uses when reading
+// PdxdocParser::section_count et al.
+
+module FileRead = structure {
+
+  // ============================================================================
+  // Singleton .bss (bootstrap-scope; M4 migrates to caller-owned)
+  // ============================================================================
+
+  // Byte length of the buffer returned by file_read_stub. Companion
+  // to file_read_stub's rax return: the caller reads (rax,
+  // file_src_len) as a (ptr, len) pair. Zero at M1 (stub always
+  // returns "not found"); the real byte-count after M2's
+  // KIND_PDXFS_FILE(read) call lands.
+  pub let mut file_src_len : u64 = uninit @align(8)
+
+  // ============================================================================
+  // file_read_stub() -> src_ptr_or_zero
+  //
+  // Signature: file_read_stub : () -> u64 !{mem} @{}
+  //   RAX (output): 0 (M1) — file not found. M2+ returns a
+  //                 non-zero buffer pointer to a caller-visible
+  //                 read-buffer holding the file's contents.
+  //
+  // Also writes file_src_len:
+  //   M1: 0 (nothing read)
+  //   M2+: byte count returned by the underlying KIND_PDXFS_FILE
+  //        (read) syscall.
+  //
+  // Leaf function; no push/pop parity.
+  //
+  // The return contract (rax = ptr-or-0; file_src_len = byte-count-
+  // or-0) is deliberate: the M2 body-only edit replaces the two
+  // stores below with the syscall wrapper and preserves the two
+  // observables so callers do not change.
+  // ============================================================================
+  pub let file_read_stub : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.M1-003 file_read_stub. Returns 0 in rax and writes 0 into file_src_len — the correct behaviour until R42 substrate (KIND_PDXFS_FILE) lands per r49-r50-plan.md §2.4. Callers reading (rax, file_src_len) as (ptr, len) see a coherent 'not found' pair. Leaf function; r11 scratch for the .bss lea. M2 replaces this body with a KIND_PDXFS_FILE(read) syscall wrapped by libpdx-cap; the (ptr, len) return shape is preserved so the M2 edit does not touch cat_dispatch.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + file_src_len];
+        mov [r11], rax;
+        xor rax, rax;                   // 0 → not found
+        ret
+      }
+    }
+}

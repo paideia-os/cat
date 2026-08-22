@@ -1,22 +1,28 @@
-// src/argv_dispatch.pdx — cat.M1-001 (skeleton) → cat.M1-002 (argv surface)
-// CatDispatch module: argv → parsed flags + positional list →
-// (stubbed) file read → exit code.
+// src/argv_dispatch.pdx — cat.M1-001 (skeleton) → cat.M1-002 (argv
+//                          surface) → cat.M1-003 (first runnable)
+// CatDispatch module: argv → parsed flags + positional list → file
+// read stub → TtySink → exit code.
 //
-// M1-002 replaces the M1-001 single-positional scan with a proper
-// flag+positional parser:
-//   flags:       -n / -A / --schema  (boolean; arity 0)
-//   positionals: file paths, collected in argv-order into pos_ptrs
+// M1-003 wires the pipeline end-to-end for the first time:
+//   * Removes the inline `file_read_stub` definition (M1-001 /
+//     M1-002 kept it here so the scaffold compiled standalone);
+//     the symbol is now re-hosted in `src/file_read.pdx` as
+//     `FileRead::file_read_stub`. The call site in
+//     `cat_dispatch` is unchanged.
+//   * Adds the `tty_reset` + `tty_write_bytes` calls in the
+//     `file_read_stub` non-zero fall-through arm (unreachable at
+//     M1 because the stub always returns 0; the wiring exists so
+//     M2's real KIND_PDXFS_FILE(read) is a body-only edit inside
+//     `file_read.pdx`).
+//   * Adds the alt entry `cat_dispatch_from_buf(buf, buf_len)`
+//     which skips argv + file read and drives `tty_reset` +
+//     `tty_write_bytes` directly. This is the earliest end-to-end
+//     runnable in the tree — it demonstrates the buf → sink
+//     pipeline without needing R42 substrate or shell.M4.
 //
-// The dispatcher (cat_dispatch) now runs `cat_reset` → `cat_parse_
-// argv` → checks `pos_count` → reads the first positional via the
-// stubbed file_read path. The M1-003 wiring will thread the file
-// read's byte buffer into TtySink; both later edits are body-only
-// against this file.
-//
-// M1-002 keeps `file_read_stub` inlined in this file so the scaffold
-// compiles standalone before src/file_read.pdx exists. M1-003
-// removes the local definition and re-hosts the symbol in
-// src/file_read.pdx (symbol-swap edit; every call site stays put).
+// The M1-003 edit is additive against the M1-002 file: the
+// `cat_dispatch` epilogue's exit-code arms are unchanged and the
+// argv parser is untouched.
 //
 // Exit-code discipline (per I4 in design/tooling/plan.md §4.2):
 //   0 — read + wrote successfully
@@ -368,17 +374,20 @@ module CatDispatch = structure {
   //   RSI: argc (count of entries in argv)
   //   RAX: exit code (0 / 2 / 3 / 4 per I4)
   //
-  // M1-002 flow:
+  // M1-003 flow:
   //   1. cat_reset() — zero parsed state.
   //   2. cat_parse_argv(argv, argc) — parse flags + positional list.
   //      Non-zero return → CAT_EXIT_USAGE_ERROR (2).
   //   3. If pos_count == 0 → CAT_EXIT_USAGE_ERROR (M2-004 replaces
   //      this arm with stdin passthrough).
-  //   4. Call file_read_stub. rax == 0 → CAT_EXIT_CAP_DENIED (4).
-  //   5. M1-003 will insert tty_write_bytes(rax, file_src_len)
-  //      between step 4's non-zero arm and the epilogue; the M1-002
-  //      body returns CAT_EXIT_OK from the fall-through arm which
-  //      is unreachable at runtime under the M1 stub.
+  //   4. Call file_read_stub (FileRead::file_read_stub in
+  //      src/file_read.pdx). rax == 0 → CAT_EXIT_CAP_DENIED (4).
+  //      At M1 the stub always returns 0; the fall-through arm is
+  //      structurally wired but unreachable until M2's KIND_PDXFS_
+  //      FILE(read) lands.
+  //   5. tty_reset() then tty_write_bytes(src_ptr, src_len). Sink
+  //      overflow → CAT_EXIT_SYSTEM_ERROR (3). Success →
+  //      CAT_EXIT_OK (0).
   //
   // Register plan (non-leaf; three nested calls):
   //   r12 = argv (callee-save copy of rdi)
@@ -397,7 +406,7 @@ module CatDispatch = structure {
   pub let cat_dispatch : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-002 cat_dispatch. Sequences cat_reset → cat_parse_argv → pos_count check → file_read_stub. Parse failure collapses to CAT_EXIT_USAGE_ERROR (2). Zero positionals collapses to CAT_EXIT_USAGE_ERROR (M2-004 replaces with stdin passthrough). file_read_stub == 0 collapses to CAT_EXIT_CAP_DENIED (4). Non-leaf: 3-push prologue (r12/r13/r14) preserves argc/argv across cat_parse_argv and keeps rsp%16 == 0 at every nested call site. Mirror-order pop in epilogue. All immediates ≤ 0x7FFFFFFF (max: 4 for CAT_EXIT_CAP_DENIED). r11 scratch for the pos_count .bss read.",
+      justification: "cat.M1-003 cat_dispatch. Sequences cat_reset → cat_parse_argv → pos_count check → file_read_stub → tty_reset → tty_write_bytes. Parse failure collapses to CAT_EXIT_USAGE_ERROR (2). Zero positionals collapses to CAT_EXIT_USAGE_ERROR (M2-004 replaces with stdin passthrough). file_read_stub == 0 collapses to CAT_EXIT_CAP_DENIED (4). tty_write_bytes TTY_SINK_OVERFLOW collapses to CAT_EXIT_SYSTEM_ERROR (3). Non-leaf: 3-push prologue (r12/r13/r14) preserves argc/argv across cat_parse_argv and keeps rsp%16 == 0 at every nested call site. After the file-read stub returns the src ptr, r12 is reused (argv is no longer needed) to stash the ptr across the tty_reset call. Mirror-order pop in epilogue. All immediates ≤ 0x7FFFFFFF (max: 4 for CAT_EXIT_CAP_DENIED). r11 scratch for the pos_count and file_src_len .bss reads. file_src_len is FileRead::file_src_len (src/file_read.pdx), resolved by unqualified linker name.",
       block: {
         // ---- prologue: save + align ------------------------------------
         push r12;
@@ -424,18 +433,36 @@ module CatDispatch = structure {
         je cat_dispatch_usage_error;
 
         // ---- Step 4: stubbed file read ---------------------------------
-        // M1-002 keeps file_read_stub inline (below); M1-003 hosts
-        // the symbol in src/file_read.pdx. Contract: rax = src ptr
-        // (0 = not found).
+        // file_read_stub is FileRead::file_read_stub in
+        // src/file_read.pdx (M1-003 re-host). Contract: rax = src
+        // ptr (0 = not found); FileRead::file_src_len holds the
+        // byte count.
         call file_read_stub;
         cmp rax, 0;
         je cat_dispatch_cap_denied;
 
-        // ---- Step 5 wiring lands at M1-003 -----------------------------
-        // At M1-002 the fall-through arm is unreachable (stub
-        // always returns 0). At M1-003 the tty_write_bytes call
-        // goes here.
-        xor rax, rax;                   // CAT_EXIT_OK (unreachable at M1)
+        // ---- Step 5: reset the sink + write bytes ----------------------
+        // Stash the file-read src ptr in r12 (argv is no longer
+        // needed at this point — cat_dispatch's argv/argc were
+        // consumed by cat_parse_argv above). This preserves the
+        // pointer across the tty_reset call which is otherwise
+        // free to clobber caller-save regs.
+        mov r12, rax;
+
+        call tty_reset;
+
+        mov rdi, r12;                   // rdi = src ptr
+        lea r11, [rip + file_src_len];
+        mov rsi, [r11];                 // rsi = src len
+        call tty_write_bytes;
+        cmp rax, 0;
+        jne cat_dispatch_system_error;
+
+        xor rax, rax;                   // CAT_EXIT_OK
+        jmp cat_dispatch_epilogue;
+
+      cat_dispatch_system_error:
+        mov rax, 3;                     // CAT_EXIT_SYSTEM_ERROR
         jmp cat_dispatch_epilogue;
 
       cat_dispatch_usage_error:
@@ -454,22 +481,65 @@ module CatDispatch = structure {
     }
 
   // ============================================================================
-  // file_read_stub() -> src_ptr_or_zero
+  // cat_dispatch_from_buf(buf, buf_len) -> exit_code
   //
-  // Signature: file_read_stub : () -> u64 !{mem} @{}
-  //   RAX: 0 (M1 stub always returns "not found"). M1-003 removes
-  //        this inline definition and re-hosts the symbol in
-  //        src/file_read.pdx (symbol-swap edit; the call site in
-  //        cat_dispatch is unchanged).
+  // Signature: cat_dispatch_from_buf : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: buf     — pointer to caller-owned byte buffer
+  //   RSI: buf_len — byte length of buf
+  //   RAX: exit code (0 = OK, 3 = system error / sink overflow;
+  //        never returns 2 or 4 since no argv + no file-read
+  //        involved)
   //
-  // Leaf function; no push/pop parity.
+  // Alt entry that skips the argv + file-read steps and drives the
+  // TtySink directly. Used by M4 tests + the M1 smoke fixture.
+  // The wire contract matches cat_dispatch's tail so a caller that
+  // already has bytes in memory does not need to fabricate an argv
+  // or a stubbed file table.
+  //
+  // Non-leaf; passes rdi + rsi to tty_write_bytes after a
+  // tty_reset. The buf/buf_len must survive the tty_reset call, so
+  // r12 stashes buf and r13 stashes buf_len.
+  //
+  // Register plan (non-leaf; two nested calls):
+  //   r12 = buf     (callee-save copy of rdi)
+  //   r13 = buf_len (callee-save copy of rsi)
+  //   r14 = pad-only (preserves SysV parity + rsp%16 == 0 alignment)
+  //
+  // rsp arithmetic (same as cat_dispatch):
+  //   entry rsp%16 == 8 → 3 pushes → rsp%16 == 0 at each nested
+  //   call site.
   // ============================================================================
-  pub let file_read_stub : () -> u64 !{mem} @{} =
-    fn () -> unsafe {
+  pub let cat_dispatch_from_buf : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-002 file_read_stub (inline; still hosted here at M1-002). Returns 0 in rax unconditionally — the correct behaviour until R42 substrate (KIND_PDXFS_FILE) lands per r49-r50-plan.md §2.4. M1-003 removes this definition and re-hosts the same symbol in src/file_read.pdx; the call site in cat_dispatch does not change. Leaf function; no push/pop parity.",
+      justification: "cat.M1-003 cat_dispatch_from_buf. Alt entry that skips argv + file lookup and drives the TtySink directly. Stashes rdi (buf) in r12 and rsi (buf_len) in r13 across the tty_reset call, then forwards them to tty_write_bytes. Return codes: TtySink's TTY_OK collapses to CAT_EXIT_OK (0); TTY_SINK_OVERFLOW collapses to CAT_EXIT_SYSTEM_ERROR (3) — matching KIND_TTY(write)'s partial-write shape at M2. Non-leaf: 3-push prologue (r12/r13/r14) preserves the args across tty_reset and keeps rsp%16 == 0 at every nested call site. Mirror-order pop in epilogue. r14 is push-only (alignment pad).",
       block: {
-        xor rax, rax;
+        // ---- prologue: save + align ------------------------------------
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                   // r12 = buf
+        mov r13, rsi;                   // r13 = buf_len
+
+        call tty_reset;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call tty_write_bytes;
+        cmp rax, 0;
+        jne cat_disp_buf_system_error;
+
+        xor rax, rax;                   // CAT_EXIT_OK
+        jmp cat_disp_buf_epilogue;
+
+      cat_disp_buf_system_error:
+        mov rax, 3;                     // CAT_EXIT_SYSTEM_ERROR
+
+      cat_disp_buf_epilogue:
+        pop r14;
+        pop r13;
+        pop r12;
         ret
       }
     }
