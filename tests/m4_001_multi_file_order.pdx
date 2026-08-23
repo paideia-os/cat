@@ -61,7 +61,7 @@
 //     unqualified-name collisions (matches the R48 vello↔vrr
 //     `vrc_→vrenc_` rename policy in paideia-os).
 
-module CatM4001 = structure {
+module M4MultiFileOrder = structure {
 
   // ============================================================================
   // Fixture .bss — populated at test entry (paideia-as has no data
@@ -221,16 +221,16 @@ module CatM4001 = structure {
         // ==============================================================
         lea r11, [rip + m4_001_argv];
         lea rax, [rip + m4_001_argv0];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
         lea r11, [rip + m4_001_argv];
         lea rax, [rip + m4_001_path_a];
-        mov [r11 + 1*8], rax;
+        mov [r11 + 8], rax;
         lea r11, [rip + m4_001_argv];
         lea rax, [rip + m4_001_path_b];
-        mov [r11 + 2*8], rax;
+        mov [r11 + 16], rax;
         lea r11, [rip + m4_001_argv];
         lea rax, [rip + m4_001_path_c];
-        mov [r11 + 3*8], rax;
+        mov [r11 + 24], rax;
 
         // ==============================================================
         // Reset stub state (cat_dispatch does not reset these —
@@ -315,27 +315,27 @@ module CatM4001 = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       m4_001_fail_exit:
         mov rax, 1;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_001_fail_len:
         mov rax, 2;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_001_fail_audit:
         mov rax, 3;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_001_fail_bytes:
         mov rax, 4;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
       }
     }
 }

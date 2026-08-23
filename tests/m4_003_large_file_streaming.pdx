@@ -83,7 +83,7 @@
 //   - `.bss` slot names prefixed `m4_003_` to sidestep cross-repo
 //     unqualified-name collisions.
 
-module CatM4003 = structure {
+module M4LargeFileStreaming = structure {
 
   // ============================================================================
   // Fixture .bss
@@ -156,10 +156,10 @@ module CatM4003 = structure {
         // ==============================================================
         lea r11, [rip + m4_003_argv];
         lea rax, [rip + m4_003_argv0];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
         lea r11, [rip + m4_003_argv];
         lea rax, [rip + m4_003_path_a];
-        mov [r11 + 1*8], rax;
+        mov [r11 + 8], rax;
 
         // ==============================================================
         // Reset stub state.
@@ -203,7 +203,7 @@ module CatM4003 = structure {
         lea rbx, [rip + tty_out_buf];
 
         // sample at offset 0.
-        lea r11, [rbx + 0];
+        lea r11, [rbx];
         xor rax, rax; mov_b rax, [r11];
         cmp rax, 0x41;
         jne m4_003_fail_bytes;
@@ -225,27 +225,27 @@ module CatM4003 = structure {
         // PASS
         xor rax, rax;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_003_fail_exit:
         mov rax, 1;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_003_fail_len:
         mov rax, 2;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_003_fail_audit:
         mov rax, 3;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_003_fail_bytes:
         mov rax, 4;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
       }
     }
 }

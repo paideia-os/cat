@@ -107,7 +107,7 @@
 //   - Instruction vocabulary stays inside the R49 reference-
 //     implementation subset (see design/architecture.md §5).
 
-module CatDispatch = structure {
+module ArgvDispatch = structure {
 
   // ============================================================================
   // Exit codes (per I4 collapsed vocabulary)
@@ -166,7 +166,7 @@ module CatDispatch = structure {
         lea r11, [rip + flag_mask];              mov [r11], rax;
         lea r11, [rip + pos_count];              mov [r11], rax;
         lea r11, [rip + parse_error_arg_index];  mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -331,11 +331,11 @@ module CatDispatch = structure {
       cat_parse_fail:
         lea r11, [rip + parse_error_arg_index];
         mov [r11], r8;
-        ret
+        ret;
 
       cat_parse_done_ok:
         xor rax, rax;
-        ret
+        ret;
       }
     }
 
@@ -561,7 +561,7 @@ module CatDispatch = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -616,7 +616,7 @@ module CatDispatch = structure {
         pop r14;
         pop r13;
         pop r12;
-        ret
+        ret;
       }
     }
 }

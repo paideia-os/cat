@@ -109,7 +109,7 @@ module TtySink = structure {
         xor rax, rax;
         lea r11, [rip + tty_out_len];
         mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -187,7 +187,7 @@ module TtySink = structure {
         mov [r11], rcx;
 
         xor rax, rax;                   // TTY_OK
-        ret
+        ret;
 
       tty_write_overflow:
         // Persist partial-write cursor before reporting.
@@ -195,7 +195,7 @@ module TtySink = structure {
         mov [r11], rcx;
 
         mov rax, 0xFFFFFFF4;            // TTY_SINK_OVERFLOW
-        ret
+        ret;
       }
     }
 
@@ -248,11 +248,11 @@ module TtySink = structure {
         mov [r11], rcx;
 
         xor rax, rax;                   // TTY_OK
-        ret
+        ret;
 
       tty_write_byte_overflow:
         mov rax, 0xFFFFFFF4;            // TTY_SINK_OVERFLOW
-        ret
+        ret;
       }
     }
 }

@@ -61,7 +61,7 @@
 //   - `.bss` slot names prefixed `m4_004_` to sidestep cross-repo
 //     unqualified-name collisions.
 
-module CatM4004 = structure {
+module M4StdinPipe = structure {
 
   // ============================================================================
   // Fixture .bss
@@ -151,7 +151,7 @@ module CatM4004 = structure {
         // ==============================================================
         lea r11, [rip + m4_004_argv];
         lea rax, [rip + m4_004_argv0];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
 
         // ==============================================================
         // Reset stub state.
@@ -212,27 +212,27 @@ module CatM4004 = structure {
       m4_004_pass:
         xor rax, rax;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_004_fail_exit:
         mov rax, 1;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_004_fail_len:
         mov rax, 2;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_004_fail_audit:
         mov rax, 3;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_004_fail_bytes:
         mov rax, 4;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
       }
     }
 }

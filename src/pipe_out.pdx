@@ -115,7 +115,7 @@ module PipeOut = structure {
       effects: {mem}, capabilities: {},
       justification: "cat.M3-001 pipe_out_reset. M3 stub carries no PipeOut-owned .bss state — every write goes through TtySink whose own reset (called separately by cat_dispatch) zeroes the sink cursor. The reset entry is kept as an API stub for symmetry with libpdx-semantic-pipe's future per-fd binding-table reset (Binding::reset in libpdx-semantic-pipe/src/binding.pdx). Leaf function; single-ret; no push/pop parity.",
       block: {
-        ret
+        ret;
       }
     }
 
@@ -274,7 +274,7 @@ module PipeOut = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       pff_err_sink:
         mov rax, 3;                       // PO_ERR_SINK
@@ -283,11 +283,11 @@ module PipeOut = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       pff_too_long_no_pop:
         mov rax, 1;                       // PO_ERR_BODY_TOO_LONG (bare return, pre-prologue)
-        ret
+        ret;
       }
     }
 
@@ -380,7 +380,7 @@ module PipeOut = structure {
         jge pfw_ok;
 
         // Else this was a full 4056-byte sub-chunk; decrement bytes_left.
-        add r14, -4056;                   // paideia-as signed imm32 (see architecture.md §5)
+        sub r14, 4056;                   // paideia-as signed imm32 (see architecture.md §5)
         jmp pfw_head;
 
       pfw_ok:
@@ -390,7 +390,7 @@ module PipeOut = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       pfw_err:
         // pipe_forward_frame's rc is already in rax (either
@@ -401,7 +401,7 @@ module PipeOut = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

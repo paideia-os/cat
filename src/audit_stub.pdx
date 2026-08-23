@@ -126,7 +126,7 @@ module AuditStub = structure {
         lea r11, [rip + _audit_broker_failed]; mov [r11], rax;
         lea r11, [rip + _audit_file_count];    mov [r11], rax;
         lea r11, [rip + _audit_last_path_ptr]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -177,11 +177,11 @@ module AuditStub = structure {
         mov [r11], rax;
 
         xor rax, rax;                    // AS_OK
-        ret
+        ret;
 
       af_fail:
         mov rax, 1;                      // AS_ERR_BROKER_UNAVAIL
-        ret
+        ret;
       }
     }
 
@@ -209,11 +209,11 @@ module AuditStub = structure {
         jne ace_no;
 
         mov rax, 1;
-        ret
+        ret;
 
       ace_no:
         xor rax, rax;
-        ret
+        ret;
       }
     }
 
@@ -235,7 +235,7 @@ module AuditStub = structure {
       block: {
         lea r11, [rip + _audit_broker_failed];
         mov [r11], rdi;
-        ret
+        ret;
       }
     }
 
@@ -257,7 +257,7 @@ module AuditStub = structure {
       block: {
         lea r11, [rip + _audit_file_count];
         mov rax, [r11];
-        ret
+        ret;
       }
     }
 }

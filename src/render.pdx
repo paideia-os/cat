@@ -137,7 +137,7 @@ module Render = structure {
         mov rax, 1;
         lea r11, [rip + render_line_num];     mov [r11], rax;
         lea r11, [rip + render_at_line_start]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -220,7 +220,7 @@ module Render = structure {
       elnp_p100k_head:
         cmp r14, r12;
         jl elnp_p100k_done;
-        add r14, -100000;
+        sub r14, 100000;
         add r13, 1;
         jmp elnp_p100k_head;
       elnp_p100k_done:
@@ -247,7 +247,7 @@ module Render = structure {
       elnp_p10k_head:
         cmp r14, r12;
         jl elnp_p10k_done;
-        add r14, -10000;
+        sub r14, 10000;
         add r13, 1;
         jmp elnp_p10k_head;
       elnp_p10k_done:
@@ -282,7 +282,7 @@ module Render = structure {
       elnp_p1k_head:
         cmp r14, r12;
         jl elnp_p1k_done;
-        add r14, -1000;
+        sub r14, 1000;
         add r13, 1;
         jmp elnp_p1k_head;
       elnp_p1k_done:
@@ -316,7 +316,7 @@ module Render = structure {
       elnp_p100_head:
         cmp r14, r12;
         jl elnp_p100_done;
-        add r14, -100;
+        sub r14, 100;
         add r13, 1;
         jmp elnp_p100_head;
       elnp_p100_done:
@@ -350,7 +350,7 @@ module Render = structure {
       elnp_p10_head:
         cmp r14, r12;
         jl elnp_p10_done;
-        add r14, -10;
+        sub r14, 10;
         add r13, 1;
         jmp elnp_p10_head;
       elnp_p10_done:
@@ -388,7 +388,7 @@ module Render = structure {
       elnp_p1_head:
         cmp r14, r12;
         jl elnp_p1_done;
-        add r14, -1;
+        sub r14, 1;
         add r13, 1;
         jmp elnp_p1_head;
       elnp_p1_done:
@@ -418,7 +418,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       elnp_err:
         mov rax, 3;                      // RENDER_ERR_SINK
@@ -427,7 +427,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -563,7 +563,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       eab_err:
         mov rax, 3;                      // RENDER_ERR_SINK
@@ -572,7 +572,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -740,7 +740,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       rwb_err_from_sink:
       rwb_err:
@@ -750,7 +750,7 @@ module Render = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

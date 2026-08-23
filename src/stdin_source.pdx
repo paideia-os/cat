@@ -100,7 +100,7 @@ module StdinSource = structure {
         lea r11, [rip + sr_stdin_buf];    mov [r11], rax;
         lea r11, [rip + sr_stdin_len];    mov [r11], rax;
         lea r11, [rip + sr_stdin_cursor]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -124,7 +124,7 @@ module StdinSource = structure {
       block: {
         lea r11, [rip + sr_stdin_buf]; mov [r11], rdi;
         lea r11, [rip + sr_stdin_len]; mov [r11], rsi;
-        ret
+        ret;
       }
     }
 
@@ -197,11 +197,11 @@ module StdinSource = structure {
         mov [r11], r10;
 
         mov rax, rcx;                  // rax = bytes copied
-        ret
+        ret;
 
       stdin_read_eof:
         xor rax, rax;
-        ret
+        ret;
       }
     }
 }

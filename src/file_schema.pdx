@@ -90,7 +90,7 @@ module FileSchema = structure {
         add rcx, 1;
         jmp fs_reset_head;
       fs_reset_done:
-        ret
+        ret;
       }
     }
 
@@ -120,7 +120,7 @@ module FileSchema = structure {
         mov [r11 + rdi*8], rsi;
 
       fs_seed_done:
-        ret
+        ret;
       }
     }
 
@@ -146,11 +146,11 @@ module FileSchema = structure {
 
         lea r11, [rip + _fs_hash_ptrs];
         mov rax, [r11 + rdi*8];
-        ret
+        ret;
 
       fs_query_none:
         xor rax, rax;
-        ret
+        ret;
       }
     }
 }

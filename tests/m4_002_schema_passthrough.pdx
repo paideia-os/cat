@@ -81,7 +81,7 @@
 //   - `.bss` slot names prefixed `m4_002_` to sidestep cross-repo
 //     unqualified-name collisions.
 
-module CatM4002 = structure {
+module M4SchemaPassthrough = structure {
 
   // ============================================================================
   // Fixture .bss
@@ -146,13 +146,13 @@ module CatM4002 = structure {
         // ==============================================================
         mov rax, 0xEEEEEEEEEEEEEEEE;
         lea r11, [rip + m4_002_schema_hash];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
         lea r11, [rip + m4_002_schema_hash];
-        mov [r11 + 1*8], rax;
+        mov [r11 + 8], rax;
         lea r11, [rip + m4_002_schema_hash];
-        mov [r11 + 2*8], rax;
+        mov [r11 + 16], rax;
         lea r11, [rip + m4_002_schema_hash];
-        mov [r11 + 3*8], rax;
+        mov [r11 + 24], rax;
 
         // ==============================================================
         // Populate argv[0] = "cat\0".
@@ -204,13 +204,13 @@ module CatM4002 = structure {
         // ==============================================================
         lea r11, [rip + m4_002_argv];
         lea rax, [rip + m4_002_argv0];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
         lea r11, [rip + m4_002_argv];
         lea rax, [rip + m4_002_flag_str];
-        mov [r11 + 1*8], rax;
+        mov [r11 + 8], rax;
         lea r11, [rip + m4_002_argv];
         lea rax, [rip + m4_002_path_a];
-        mov [r11 + 2*8], rax;
+        mov [r11 + 16], rax;
 
         // ==============================================================
         // Reset stub state.
@@ -263,7 +263,7 @@ module CatM4002 = structure {
         lea rbx, [rip + tty_out_buf];
 
         // byte 0 = op = 0x01
-        lea r11, [rbx + 0];
+        lea r11, [rbx];
         xor rax, rax; mov_b rax, [r11];
         cmp rax, 0x01;
         jne m4_002_fail_hdr;
@@ -338,37 +338,37 @@ module CatM4002 = structure {
       m4_002_pass:
         xor rax, rax;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_exit:
         mov rax, 1;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_len:
         mov rax, 2;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_audit:
         mov rax, 3;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_hdr:
         mov rax, 4;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_hash:
         mov rax, 5;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
 
       m4_002_fail_body:
         mov rax, 6;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
-        ret
+        ret;
       }
     }
 }

@@ -129,25 +129,25 @@ module RawByteChunk = structure {
         // Install schema-hash placeholder pattern.
         mov rax, 0x1111111111111111;
         lea r11, [rip + _rbc_schema_hash];
-        mov [r11 + 0*8], rax;
+        mov [r11], rax;
 
         mov rax, 0x2222222222222222;
         lea r11, [rip + _rbc_schema_hash];
-        mov [r11 + 1*8], rax;
+        mov [r11 + 8], rax;
 
         mov rax, 0x3333333333333333;
         lea r11, [rip + _rbc_schema_hash];
-        mov [r11 + 2*8], rax;
+        mov [r11 + 16], rax;
 
         mov rax, 0x4444444444444444;
         lea r11, [rip + _rbc_schema_hash];
-        mov [r11 + 3*8], rax;
+        mov [r11 + 24], rax;
 
         // Zero _rbc_file_offset.
         xor rax, rax;
         lea r11, [rip + _rbc_file_offset];
         mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -216,7 +216,7 @@ module RawByteChunk = structure {
         lea r11, [rip + _rbc_file_offset];
         mov rcx, [r11];
         lea r11, [rip + _rbc_scratch];
-        mov [r11 + 0], rcx;               // qword store — offset LE
+        mov [r11], rcx;               // qword store — offset LE
 
         // ---- Byte-copy src → _rbc_scratch[8..], accumulating sub_len -
         xor r13, r13;                     // sub_len = 0
@@ -272,7 +272,7 @@ module RawByteChunk = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
 
       rec_err:
         // rax already holds pipe_forward_frame's error rc; propagate.
@@ -281,7 +281,7 @@ module RawByteChunk = structure {
         pop r13;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 
@@ -302,7 +302,7 @@ module RawByteChunk = structure {
       block: {
         lea r11, [rip + _rbc_file_offset];
         mov rax, [r11];
-        ret
+        ret;
       }
     }
 }

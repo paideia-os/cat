@@ -164,7 +164,7 @@ module FileRead = structure {
         xor rax, rax;
         lea r11, [rip + fr_seed_count];   mov [r11], rax;
         lea r11, [rip + fr_next_handle];  mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -218,11 +218,11 @@ module FileRead = structure {
         mov [r11], rax;
 
         xor rax, rax;                  // FR_OK
-        ret
+        ret;
 
       seed_push_full:
         mov rax, 1;                    // FR_ERR_SEED_FULL
-        ret
+        ret;
       }
     }
 
@@ -264,11 +264,11 @@ module FileRead = structure {
         // Persist candidate.
         lea r11, [rip + fr_next_handle];
         mov [r11], rax;
-        ret                             // rax = new handle
+        ret;                            // rax = new handle
 
       file_open_none:
         xor rax, rax;                  // 0 = no more seeds / not found
-        ret
+        ret;
       }
     }
 
@@ -373,11 +373,11 @@ module FileRead = structure {
 
         mov rax, rcx;                  // rax = bytes copied
         pop r12;
-        ret
+        ret;
 
       fr_chunk_eof_bare:
         xor rax, rax;                  // 0 = EOF / bad handle
-        ret
+        ret;
       }
     }
 
@@ -398,7 +398,7 @@ module FileRead = structure {
       justification: "cat.M2-001 file_close. M2 no-op: R42 will replace the body with sys_pdxfs_close(rdi) via libpdx-cap. The M2 stub does not deallocate seed table entries — cat_dispatch re-runs file_read_reset between invocations. Leaf function; xor rax,rax returns 0 (success).",
       block: {
         xor rax, rax;
-        ret
+        ret;
       }
     }
 }
