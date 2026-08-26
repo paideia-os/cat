@@ -12,7 +12,7 @@ in the paideia-os meta repo; see `MIRROR.md` §1.
 | ID              | Title                                                                    | State  |
 |-----------------|--------------------------------------------------------------------------|--------|
 | M1-001 (#1)     | scaffold + caps.decl (one KIND_PDXFS_FILE cap per file arg)              | LANDED |
-| M1-002 (#2)     | argv surface via libpdx-argv (cat [-n|-A|--schema] <file>...)            | LANDED |
+| M1-002 (#2)     | argv surface (cat [-n|-A|--schema] <file>...)                            | LANDED |
 | M1-003 (#3)     | first runnable: single-file KIND_TTY output                              | LANDED |
 | M2-001 (#4)     | multi-file concatenation (arg-order preserved)                          | LANDED |
 | M2-002 (#5)     | -n line-numbering + -A non-printable rendering                          | LANDED |
@@ -30,6 +30,48 @@ in the paideia-os meta repo; see `MIRROR.md` §1.
 
 See `design/tooling/r49-r50-plan.md` §5.5 in paideia-os for the
 full milestone breakdown (M1–M5) and cross-repo dependencies.
+
+**Correction (ENH-006, #18):** the M1-002 row above previously read
+"argv surface **via libpdx-argv**". That was false — `cat_parse_argv`
+(`src/argv_dispatch.pdx`) has always been a hand-rolled inline byte
+scanner, and `deps.list` has always declared an empty v1.0 dep set.
+See `design/architecture.md` §2 and `.plans/m1-002-notes.md` for the
+libpdx-argv migration's actual status (still open, tracked as #25).
+
+## Enhancement wave (v1.x)
+
+Nine issues filed against `docs/enhancement-plan.md`'s findings.
+Landed so far:
+
+| ID       | #   | Title                                                          | State  |
+|----------|-----|-----------------------------------------------------------------|--------|
+| ENH-001  | #17 | `_start` + `cat.ld` linker script + linked `cat.elf`            | LANDED (partial — see note) |
+| ENH-005  | #20 | Wire `--version`; strip `--help`; fix `--schema` text           | LANDED |
+| ENH-006  | #18 | Correct the libpdx-argv claim in STATUS.md                      | LANDED |
+| ENH-009  | #19 | Raise `NAME_MAX_LEN` from 236 to 255                            | LANDED |
+
+**ENH-001 note:** `tools/build.sh` now links every `src/*.o` into
+`build-out/cat.elf` via `src/cat.ld`, and `src/entry.pdx` provides a
+real `_start` (execve-ABI argv/argc read, `sys_exit` on return). This
+closes the walk-back finding that the tree produced no linkable
+artifact at all. It deliberately does NOT convert `FileRead` /
+`TtySink`'s stub bodies to raw `sys_open`/`sys_read`/`sys_write`/
+`sys_close` — that would bypass the `KIND_PDXFS_FILE` / `KIND_TTY`
+capability model `caps.decl` commits to, which is exactly the "one
+canonical cat" architecture question ENH-002 (#22) exists to decide
+deliberately and cross-repo, not to pre-empt inside a linker-script
+patch. Until ENH-002 resolves, `cat.elf` links but its file-I/O
+pipeline remains stub-gated (`file_open` against an unseeded table
+returns 0 → exit 4 for every real path). `--version` and the
+usage-error path are real (no stub involved) because they bypass
+`cat_dispatch` entirely.
+
+Remaining open: ENH-002 (#22, cross-repo canonicalization), ENH-003
+(#23, stderr diagnostics — deps on ENH-002's I/O layer being real),
+ENH-004 (#24, 64 KiB sink ceiling — same dependency), ENH-007 (#25,
+libpdx-argv migration), ENH-008 (#21, RawByteChunk hash — needs the
+canonical DDL hash value from libpdx-semantic-pipe, not yet
+researched here).
 
 ## Substrate posture
 

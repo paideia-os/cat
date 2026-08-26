@@ -1,0 +1,164 @@
+// src/entry.pdx — cat.ENH-001 (paideia-os/cat #17)
+// Entry module: process entry point + real process-exit / version
+// diagnostics.
+//
+// Why this file exists
+// ---------------------
+// Every module up to this point (ArgvDispatch, FileRead, TtySink,
+// Render, AuditStub, FileSchema, PipeOut, RawByteChunk, StdinSource)
+// was assembled by `tools/build.sh` into a standalone `.o` and never
+// linked. There was no `_start`, no `.ld` script, and no artifact the
+// kernel could load — `docs/enhancement-plan.md` §2 calls this out as
+// the load-bearing gap behind the v1.0.0 walk-back. This module adds
+// the missing entry point; `src/cat.ld` + the `tools/build.sh` link
+// step add the other two pieces.
+//
+// Scope note (see STATUS.md "Enhancement wave" for the full picture)
+// --------------------------------------------------------------------
+// `_start` here performs exactly two REAL syscalls: `sys_exit` (SC+
+// ID 60, unconditionally on the way out) and `sys_write` (SC+ ID 1,
+// only on the `--version` fast path below). It does NOT convert
+// `FileRead` / `TtySink`'s bodies to real `sys_open`/`sys_read`/
+// `sys_write`/`sys_close` for the main file-reading pipeline —
+// `cat_dispatch` is called exactly as it always was, against the
+// same test-seedable stub substrate. Doing the fuller conversion
+// would bypass the `KIND_PDXFS_FILE(read)` / `KIND_TTY(write)`
+// capability model `caps.decl` commits to, in favour of the
+// monorepo cat.pdx's raw-fd SC+ model — that is precisely the "one
+// canonical cat" architecture question ENH-002 (#22) exists to
+// decide deliberately and cross-repo. This module deliberately does
+// not pre-empt that decision; it only fixes the walk-back's most
+// concrete, uncontested finding (no linkable artifact at all).
+//
+// argc/argv ABI
+// -------------
+// Per the frozen execve ABI (design/user/execve-abi.md in
+// paideia-os; see also src/user/cat.pdx there), argc arrives in rdi
+// and argv in rsi at process entry — registers, not the stack.
+// `ArgvDispatch::cat_dispatch(argv, argc)` takes them in the OPPOSITE
+// order (arg1 = argv → rdi, arg2 = argc → rsi), so `_start` swaps
+// them via r8/r9 before the call.
+//
+// --version fast path
+// --------------------
+// ENH-005 (#20) disposition: `--version` is wired up (a version
+// string a user or `pkg` can compare against an installed inode is
+// worth a handful of byte-compares); `--help` is NOT (that's
+// `cat.pdxdoc`'s job via `doc cat` — see cat.pdxdoc's Flags section).
+// Recognized ONLY as the sole argument (argc == 2, argv[1] ==
+// "--version" byte-exact) — checked BEFORE cat_reset/cat_parse_argv
+// run, so it never touches ArgvDispatch's flag_mask or FLAG_SCHEMA
+// plumbing. This is a deliberate scope cut: threading a FLAG_VERSION
+// bit through cat_parse_argv/cat_dispatch would require those
+// functions to gain the `sysreg` effect (for the sys_write below)
+// and cascade through every caller up to here anyway, for a flag
+// that never touches file I/O. Handling it entirely in `_start` — a
+// leaf byte-compare plus one syscall — keeps that effect/capability
+// change local to the one function that already needs it. Any other
+// combination (`cat --version foo`, `cat -n --version`) falls
+// through to the normal parser, which rejects "--version" as an
+// unrecognized long flag (exit 2) — an acceptable edge case per the
+// disposition in `docs/enhancement-plan.md` §3(a).
+//
+// Encoder guardrails (matches argv_dispatch.pdx's own discipline)
+// -----------------------------------------------------------------
+// - Byte loads use `xor rax, rax; mov_b rax, [ptr]` to work around
+//   paideia-as #1248 (cmp al, imm8 currently emits as cmp rax, imm8
+//   with REX.W, so the upper bits of rax must be zero for the byte
+//   compare to observe the loaded byte cleanly).
+// - Reserved label prefix: every label here is prefixed `entry_` per
+//   the paideia-as reserved-word discipline.
+// - `_start` is `@no_frame`: it never returns to a caller (ends in
+//   sys_exit), so the SysV callee-save contract does not apply —
+//   same posture as every other `_start` in this tree family (see
+//   src/user/cat.pdx / true.pdx / echo_client.pdx in paideia-os).
+// - Bare `call cat_dispatch` with no prologue push mirrors
+//   src/user/shell.pdx's `_start` (`call dispatch_init` as its very
+//   first instruction) — process entry hands off with rsp already
+//   16-byte aligned, so a bare `call` lands the callee at the
+//   standard post-CALL rsp%16 == 8 that `cat_dispatch`'s own 5-push
+//   prologue comment assumes.
+
+module Entry = structure {
+
+  // ============================================================================
+  // "cat (paideia-os) 1.0.0\n" — 23 wire bytes + NUL. Immutable =>
+  // .rodata, folded into the text PT_LOAD by cat.ld (same as
+  // cat_err_prefix / cat_err_suffix in the monorepo's cat.pdx).
+  // ============================================================================
+  pub let entry_version_msg : [u8; 24] = "cat (paideia-os) 1.0.0\n\0"
+  pub let entry_version_msg_len : u64 = 23
+
+  // ============================================================================
+  // _start — process entry point. Never returns.
+  //
+  // Register plan:
+  //   r8  = argc (from rdi, the execve ABI register)
+  //   r9  = argv (from rsi)
+  //   r10 = argv[1] pointer, --version fast-path only
+  //
+  // Effects: {mem, sysreg} — mem for the register-to-register argc/
+  //   argv shuffle and the version-string byte compares; sysreg for
+  //   the two raw `syscall` instructions (sys_write on the --version
+  //   path, sys_exit unconditionally).
+  // Caps: @{fs, sched} — fs for sys_write for --version (same bucket
+  //   the monorepo's cat.pdx uses for its own inlined sys_write
+  //   calls); sched for sys_exit's task teardown.
+  // ============================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "ENH-001 (paideia-os/cat #17) _start. Reads argc/argv from rdi/rsi per the frozen execve ABI and swaps them into cat_dispatch's (argv, argc) parameter order via r8/r9. --version fast path (ENH-005, #20): if argc == 2 (r8), load argv[1] (r9 + 8) into r10 and byte-compare it against '--version\\0' (10 bytes including NUL) using the xor rax,rax + mov_b + cmp rax,imm pattern (#1248 workaround) -- on an exact match, sys_write(1, entry_version_msg, 23) then sys_exit(0), never touching cat_dispatch/cat_parse_argv. On any mismatch (wrong argc, wrong bytes, or any byte position) control falls through to entry_normal_dispatch: call cat_dispatch(argv, argc), then sys_exit(rax) with cat_dispatch's own exit code (0/2/3/4 per I4). Bare `call cat_dispatch` with no prologue push, mirroring shell.pdx's `_start` (`call dispatch_init` as its first instruction) -- process entry hands off with rsp already 16-byte aligned so the callee sees the standard post-CALL rsp%16==8 that cat_dispatch's own 5-push prologue assumes. @no_frame: this function ends in sys_exit and never returns to a caller, so the SysV callee-save contract does not apply -- same posture as every other _start in the paideia-os user tree (true.pdx / echo_client.pdx / cat.pdx). All labels prefixed `entry_` per the paideia-as reserved-word discipline.",
+      block: {
+        mov r8, rdi;                    // r8 = argc
+        mov r9, rsi;                    // r9 = argv
+
+        // ---- --version fast path: argc == 2 && argv[1] == "--version" ----
+        cmp r8, 2;
+        jne entry_normal_dispatch;
+
+        mov r10, [r9 + 8];               // r10 = argv[1]
+
+        xor rax, rax; mov_b rax, [r10]; cmp rax, 0x2D; jne entry_normal_dispatch;     // '-'
+        xor rax, rax; mov_b rax, [r10 + 1]; cmp rax, 0x2D; jne entry_normal_dispatch; // '-'
+        xor rax, rax; mov_b rax, [r10 + 2]; cmp rax, 0x76; jne entry_normal_dispatch; // 'v'
+        xor rax, rax; mov_b rax, [r10 + 3]; cmp rax, 0x65; jne entry_normal_dispatch; // 'e'
+        xor rax, rax; mov_b rax, [r10 + 4]; cmp rax, 0x72; jne entry_normal_dispatch; // 'r'
+        xor rax, rax; mov_b rax, [r10 + 5]; cmp rax, 0x73; jne entry_normal_dispatch; // 's'
+        xor rax, rax; mov_b rax, [r10 + 6]; cmp rax, 0x69; jne entry_normal_dispatch; // 'i'
+        xor rax, rax; mov_b rax, [r10 + 7]; cmp rax, 0x6F; jne entry_normal_dispatch; // 'o'
+        xor rax, rax; mov_b rax, [r10 + 8]; cmp rax, 0x6E; jne entry_normal_dispatch; // 'n'
+        xor rax, rax; mov_b rax, [r10 + 9]; cmp rax, 0;    jne entry_normal_dispatch; // NUL
+
+        // Exact match: sys_write(1, entry_version_msg, 23). SC+ ID 1.
+        mov rdi, 1;
+        lea rsi, [rip + entry_version_msg];
+        mov rdx, 23;
+        mov rax, 1;
+        syscall;
+
+        // sys_exit(0). SC+ ID 60. Never returns.
+        xor rdi, rdi;
+        mov rax, 60;
+        syscall;
+
+        hlt;
+
+      entry_normal_dispatch:
+        // ---- Normal path: cat_dispatch(argv, argc) ----------------------
+        mov rdi, r9;                     // argv
+        mov rsi, r8;                     // argc
+        call cat_dispatch;
+
+        // sys_exit(rax). SC+ ID 60. Never returns.
+        mov rdi, rax;
+        mov rax, 60;
+        syscall;
+
+        // Unreachable. Defensive hlt (matches every other _start in the
+        // paideia-os user tree).
+        hlt
+      }
+    } @no_frame
+}

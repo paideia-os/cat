@@ -55,12 +55,15 @@ mkdir -p "$BUILD_DIR"
 
 FAIL=0
 COUNT=0
+SRC_OBJECTS=()
 for pdx in src/*.pdx; do
     [ -f "$pdx" ] || continue
     COUNT=$((COUNT + 1))
     obj="$BUILD_DIR/$(basename "$pdx" .pdx).o"
     if ! "$PA" build --emit elf64 "$pdx" -o "$obj" 2>&1; then
         FAIL=$((FAIL + 1))
+    else
+        SRC_OBJECTS+=("$obj")
     fi
 done
 
@@ -77,4 +80,29 @@ fi
 
 echo "[build] $COUNT source(s), $FAIL failure(s)"
 [ "$FAIL" -eq 0 ] || exit 1
+
+# ---- Link cat.elf from the assembled src/ objects (ENH-001, #17) ----------
+# cat is a multi-module binary (ArgvDispatch/FileRead/TtySink/Render/
+# AuditStub/FileSchema/PipeOut/RawByteChunk/StdinSource/Entry) -- unlike
+# the monorepo's self-contained src/user/cat.pdx, every object above must
+# link together against one linker script. Mirrors the monorepo build-
+# user.sh convention: `ld -nostdlib --warn-common --fatal-warnings -T
+# <script> -o <elf> <objects...>`. tests/*.o are deliberately excluded --
+# they are fixtures, not part of the shipped binary.
+CAT_LINK_SCRIPT="src/cat.ld"
+if [ ! -f "$CAT_LINK_SCRIPT" ]; then
+    echo "[build] FAIL: linker script missing: $CAT_LINK_SCRIPT" >&2
+    exit 1
+fi
+
+echo "[link] ld -T $CAT_LINK_SCRIPT -> $BUILD_DIR/cat.elf"
+if ! ld -nostdlib --warn-common --fatal-warnings \
+    -T "$CAT_LINK_SCRIPT" \
+    -o "$BUILD_DIR/cat.elf" \
+    "${SRC_OBJECTS[@]}"; then
+    echo "[link] FAIL" >&2
+    exit 1
+fi
+
 echo "[build] OK"
+echo "[build] linked: $BUILD_DIR/cat.elf"

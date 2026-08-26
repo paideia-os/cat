@@ -96,8 +96,9 @@
 //     prefix.
 //   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses immediate ≤ 0x7FFFFFFF (M2's
-//     largest: 65536 for CHUNK_MAX / TTY_OUT_CAP; 236 for
-//     NAME_MAX_LEN in the argv parser body).
+//     largest: 65536 for CHUNK_MAX / TTY_OUT_CAP; 255 for
+//     NAME_MAX_LEN in the argv parser body -- matches the
+//     kernel PATH_MAX ceiling, ENH-009 / #19).
 //   - r11 scratch (paideia-as reserved); reloaded before every
 //     `.bss` read/write.
 //   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248).
@@ -138,7 +139,7 @@ module ArgvDispatch = structure {
   // ============================================================================
   // Argv-parse limits
   // ============================================================================
-  pub let NAME_MAX_LEN : u64 = 236
+  pub let NAME_MAX_LEN : u64 = 255
   pub let POS_MAX      : u64 = 8
 
   // ============================================================================
@@ -189,7 +190,7 @@ module ArgvDispatch = structure {
   pub let cat_parse_argv : (u64, u64) -> u64 !{mem} @{} =
     fn (argv: u64) (argc: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M1-002 cat_parse_argv. Preserved verbatim across the M2 wave — libpdx-argv M2's FKIND_UNKNOWN=boolean fix removes the original blocker, but migrating cat's argv surface to libpdx-argv is scheduled at cat.M3 per r49-r50-plan.md §5.5 so the M2 wave keeps byte-compat with the M1 golden fixtures. Walks argv[1..argc-1]; classifies each arg as long-flag / short-flag / positional per design/architecture.md §2 grammar. Boolean-only flags (arity 0 — a shell that wrote 'cat -n foo.txt' means cat reads foo.txt, not that -n's value is foo.txt). Long-flag whitelist: --schema only (byte-exact compare). Short-flag whitelist: -n and -A. Positional accumulator uses pos_ptrs[pos_count] and enforces POS_MAX = 8. Every positional walked to NUL with NAME_MAX_LEN = 236 bound. All immediates in `cmp reg, imm` are ≤ 0x7FFFFFFF (max 236). Every byte load preceded by xor rax,rax (#1248). Leaf function.",
+      justification: "cat.M1-002 cat_parse_argv. Preserved verbatim across the M2 wave — libpdx-argv M2's FKIND_UNKNOWN=boolean fix removes the original blocker, but migrating cat's argv surface to libpdx-argv is scheduled at cat.M3 per r49-r50-plan.md §5.5 so the M2 wave keeps byte-compat with the M1 golden fixtures. Walks argv[1..argc-1]; classifies each arg as long-flag / short-flag / positional per design/architecture.md §2 grammar. Boolean-only flags (arity 0 — a shell that wrote 'cat -n foo.txt' means cat reads foo.txt, not that -n's value is foo.txt). Long-flag whitelist: --schema only (byte-exact compare). Short-flag whitelist: -n and -A. Positional accumulator uses pos_ptrs[pos_count] and enforces POS_MAX = 8. Every positional walked to NUL with NAME_MAX_LEN = 255 bound (ENH-009, #19 -- matches the kernel PATH_MAX ceiling). All immediates in `cmp reg, imm` are ≤ 0x7FFFFFFF (max 255). Every byte load preceded by xor rax,rax (#1248). Leaf function.",
       block: {
         mov r9, rdi;
         mov r10, rsi;
@@ -284,7 +285,7 @@ module ArgvDispatch = structure {
         xor r11, r11;
 
       cat_parse_pos_measure_head:
-        cmp r11, 236;
+        cmp r11, 255;                    // NAME_MAX_LEN (ENH-009, #19)
         jg cat_parse_name_too_long;
 
         xor rax, rax;

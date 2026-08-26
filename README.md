@@ -11,7 +11,7 @@ cat [-n] [-A]                           # zero positionals: read stdin
 
 Flags are boolean (arity 0) and may appear anywhere in `argv`. At most
 `POS_MAX = 8` file arguments per invocation; each path is bounded at
-`NAME_MAX_LEN = 236` bytes.
+`NAME_MAX_LEN = 255` bytes.
 
 ## Description
 
@@ -88,11 +88,16 @@ Behavioural notes traced to source:
   `--schema`, `--schema=value`, and a bare `--`.
 - **A bare `-` is a positional**, not a flag (`argv[i][1] == 0` falls through
   to the positional path). `argv[0]` is always skipped.
-- **`--help` and `--version` are not accepted.** `cat.pdxdoc` describes them
-  as inherited from the standard flag vocabulary, but the parser's long-flag
-  whitelist in `src/argv_dispatch.pdx` contains only `--schema`; either one
-  currently exits 2. Long-form documentation is served by `doc cat` reading
-  `cat.pdxdoc`.
+- **`--version` is handled in `_start` (`src/entry.pdx`), not the argv
+  parser.** As the sole argument (`argc == 2`, byte-exact `--version`) it
+  prints the build version and exits 0 before `cat_reset`/`cat_parse_argv`
+  ever run — ENH-005 (#20). Combined with anything else (`cat --version
+  foo`) it falls through to the normal parser, whose long-flag whitelist in
+  `src/argv_dispatch.pdx` still contains only `--schema`, so that
+  combination exits 2 as an unrecognized long flag.
+- **`--help` is not accepted, deliberately.** Long-form documentation is
+  served by `doc cat` reading `cat.pdxdoc`, not a second copy of the flag
+  table compiled into the binary.
 - **`--schema` on a schemaless file does not fail.** `cat.pdxdoc` claims a
   refusal with exit 2 in that case; the implemented behaviour is the
   `RawByteChunk@0.1` fallback described above.
@@ -176,7 +181,7 @@ collapse to exit 2, with the offending `argv` index left in
 | 2 | `PARSE_ERR_UNKNOWN_OR_CLUSTERED_SHORT` | An unknown short flag, or more than one letter after a single hyphen. |
 | 3 | `PARSE_ERR_POS_OVERFLOW` | More than `POS_MAX = 8` positionals, or an empty-string positional. |
 | 4 | `PARSE_ERR_LONG_MISSING_NAME` | `--` with no name, or `--=…`. |
-| 5 | `PARSE_ERR_NAME_TOO_LONG` | A positional longer than `NAME_MAX_LEN = 236` bytes. |
+| 5 | `PARSE_ERR_NAME_TOO_LONG` | A positional longer than `NAME_MAX_LEN = 255` bytes. |
 
 ## Capabilities
 
@@ -298,6 +303,8 @@ deps.list                  # shared-lib deps (empty at v1.0)
 manifest.pdxsig            # dual-signed package manifest
 cat.pdxdoc                 # long-form doc, the `doc cat` back-end
 design/architecture.md     # internal shape spec (argv grammar, pipeline)
+src/entry.pdx              # Entry: _start + --version fast path
+src/cat.ld                 # linker script (text/data/bss layout)
 src/argv_dispatch.pdx      # ArgvDispatch: argv scan + top-level dispatcher
 src/file_read.pdx          # FileRead: streaming open/read-chunk/close
 src/stdin_source.pdx       # StdinSource: streaming stdin read
@@ -314,9 +321,13 @@ CHANGELOG.md               # release history (v1.0.0)
 MIRROR.md                  # package staging-push manifest
 ```
 
-`bash tools/build.sh` assembles the tree; it resolves paideia-as from
-`$PAIDEIA_AS`, a sibling `paideia-os` checkout, or `$PATH`, and requires
-version 0.21.0 or newer. Every source and test file observes the
+`bash tools/build.sh` assembles every `src/` and `tests/` `.pdx` file, then
+links the `src/` objects (ENH-001, #17) via `src/cat.ld` into
+`build-out/cat.elf`, using the `_start` entry point in `src/entry.pdx`
+(`tests/*.pdx` are fixtures and are deliberately excluded from the link).
+It resolves paideia-as from `$PAIDEIA_AS`, a sibling `paideia-os` checkout,
+or `$PATH`, and requires version 0.21.0 or newer. Every source and test
+file observes the
 paideia-as conformance rules recorded in `design/architecture.md` §5:
 PascalCase module basename, no `test` mnemonic, `cmp`-immediate-32 only,
 `r11` as reserved scratch, zero-then-`mov_b` byte loads, and SysV

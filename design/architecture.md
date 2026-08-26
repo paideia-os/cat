@@ -20,11 +20,13 @@ doc; read that first for the D2 / D3 / I4 invariants and for why
 surface is:
 
 - **argv:** `cat [-n|-A|--schema] <file>...` reads each file in
-  argv-order and writes its bytes to stdout. `cat --help` and
-  `cat --version` follow the D3 standard flag vocabulary in
-  `design/tooling/plan.md` I3. `cat` with zero positional files
-  reads from stdin (KIND_IPC_ENDPOINT) — this path is exercised
-  at M2-004.
+  argv-order and writes its bytes to stdout. `cat --version` (as the
+  sole argument) prints the build version and exits 0 — handled in
+  `_start` ahead of the normal parser (ENH-005, #20). There is no
+  `--help`; long-form documentation lives in `cat.pdxdoc` and is
+  queried via `doc cat`, not compiled into the binary. `cat` with
+  zero positional files reads from stdin (KIND_IPC_ENDPOINT) — this
+  path is exercised at M2-004.
 - **stdout (text):** file bytes going verbatim to KIND_TTY(write);
   `-n` prefixes each output line with its right-justified 6-column
   line number followed by a tab; `-A` renders non-printable bytes
@@ -36,7 +38,7 @@ surface is:
   (M3-002). Both schemas are declared in `caps.decl` at M1 so
   consumers can inspect the manifest early.
 - **stderr:** diagnostics (unreadable file, cap denied, sink
-  overflow).
+  overflow) — not yet implemented; see paideia-os/cat #23.
 - **exit codes** (per I4 in `design/tooling/plan.md` §4.2):
   - 0 — every file read and rendered successfully.
   - 2 — usage error (missing file, unknown flag, name too long).
@@ -45,7 +47,8 @@ surface is:
   - 4 — cap denied (no read cap for a named file's path).
 
 Internally the binary is five modules at M2, extended to nine at
-M3:
+M3, plus a tenth (`Entry`) added by the v1.x enhancement wave's
+ENH-001 (#17) — see the end of this section:
 
 - `CatDispatch` (`src/argv_dispatch.pdx`) — argv parsing at M2
   (inline byte-scan; M3 migrates to `libpdx-argv` now that
@@ -142,6 +145,24 @@ smoke-checking the M2 sink cap.
   when the `svc.audit-journal` broker binding lands; the
   `cat_dispatch` call site is invariant.
 
+**ENH-001 (#17) adds a tenth module:**
+
+- `Entry` (`src/entry.pdx`) — process entry point. `_start` reads
+  argc/argv from rdi/rsi per the frozen execve ABI, handles the
+  `--version` fast path directly (ENH-005, #20 — a real `sys_write`
+  + `sys_exit`, bypassing `cat_dispatch` entirely so it never
+  touches the stub substrate), and otherwise calls
+  `cat_dispatch(argv, argc)` and `sys_exit`s with its return value.
+  Paired with `src/cat.ld` (linker script) and the link step
+  `tools/build.sh` added, this is what turns the nine modules above
+  into a loadable `build-out/cat.elf` — previously nothing in this
+  repo produced a linkable artifact at all. `Entry` is the ONLY
+  module in this tree that issues a real `syscall`; `cat_dispatch`
+  and everything beneath it are called exactly as before, against
+  the same stub substrate (see STATUS.md's "Enhancement wave"
+  section for why that conversion is deliberately out of scope
+  here).
+
 ---
 
 ## 2. Argv grammar (M1-002; preserved verbatim through M2)
@@ -172,16 +193,25 @@ Grammar limits:
 - Flags are stored as a bit mask (`FLAG_N = 0x1`, `FLAG_A = 0x2`,
   `FLAG_SCHEMA = 0x4`). Storage is a single u64 in `.bss`.
 
-Migration to `libpdx-argv`: **now unblocked** by libpdx-argv
-M2-001 (`FlagSpec::lookup` returns `FKIND_UNKNOWN = 0xFF` on
-miss; the parser treats it identically to `FKIND_BOOL` so
-`cat -n foo.txt` no longer binds `foo.txt` as `-n`'s value).
-Migration is scheduled at cat.M3 per `r49-r50-plan.md` §5.5 so
-the M2 wave stays byte-compatible with the M1 golden fixtures.
-The inline parser is byte-for-byte compatible with what
-libpdx-argv M2 produces (same `pos_ptrs` shape, same flag bit
-mask, same error codes) so the M3 migration is a call-site
-swap, not a data-shape rewrite.
+Migration to `libpdx-argv`: **still not done.** libpdx-argv M2-001
+(`FlagSpec::lookup` returns `FKIND_UNKNOWN = 0xFF` on miss; the
+parser treats it identically to `FKIND_BOOL` so `cat -n foo.txt`
+no longer binds `foo.txt` as `-n`'s value) unblocked the migration,
+and it was scheduled for cat.M3 per `r49-r50-plan.md` §5.5 — but
+M3 (#8, #9, #10) landed the schema/audit layer without touching the
+parser, and STATUS.md's M1-002 row incorrectly claimed the
+libpdx-argv surface had already landed (corrected by ENH-006,
+paideia-os/cat #18). `.plans/m1-002-notes.md` records the original
+"why not libpdx-argv at M1" rationale; that rationale — parser
+byte-compatibility with the M1 golden fixtures during the M1→M2
+wave — no longer applies now that M1-M4 are all closed, so nothing
+technical blocks the migration today. It remains open as ENH-007
+(#25), sequenced after the entry-point work (#17) lands so the
+migration exercises a linkable binary rather than a design-only
+call-site swap. The inline parser is byte-for-byte compatible with
+what libpdx-argv M2 produces (same `pos_ptrs` shape, same flag bit
+mask, same error codes), so ENH-007 remains a call-site swap, not a
+data-shape rewrite.
 
 ---
 

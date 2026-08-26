@@ -93,26 +93,44 @@ size (M2-003; regression test at M4-003).
 .END-SECTION
 
 .SECTION Flags
-`--help` / `--version` follow the standard I3 flag vocabulary in
-design/tooling/plan.md §4.2. The tool-specific flags are:
+`--version` prints the tool's own build version and exits 0; it is
+handled directly in `_start` before argv reaches the parser, so it
+composes with nothing else on the command line (`cat --version`
+only — extra arguments fall through to the normal parser and are
+usage errors). There is no `--help`: long-form documentation is a
+`doc cat` query against this file, not a second copy of the flag
+table compiled into the binary (ENH-005, paideia-os/cat #20).
+
+The tool-specific flags are:
 
 .CODE
-  -n         Prefix each output line with a right-justified 6-column
-             line number followed by a tab. Numbering starts at 1
-             and is invocation-global (spans across multiple file
-             arguments).
+  -n          Prefix each output line with a right-justified 6-column
+              line number followed by a tab. Numbering starts at 1
+              and is invocation-global (spans across multiple file
+              arguments).
 
-  -A         Render non-printable bytes as visible escapes:
-               control chars 0x00..0x1F, 0x7F  → ^X (X = c ^ 0x40)
-               high-bit chars 0x80..0xFF       → M-x
-               newline                         → $\n
-             Convenience alias equivalent to POSIX `cat -vET`.
+  -A          Render non-printable bytes as visible escapes:
+                control chars 0x00..0x1F, 0x7F  → ^X (X = c ^ 0x40)
+                high-bit chars 0x80..0xFF       → M-x
+                newline                         → $\n
+              Convenience alias equivalent to POSIX `cat -vET`.
 
-  --schema   Force schema-typed passthrough even when the input file
-             carries no schema hash. Useful for asserting a
-             downstream consumer's assumption that a pipeline
-             carries typed records. Refuses (exit 2) if the file
-             has no readable .pdxfs metadata.
+  --schema    Force schema-typed passthrough even when the input file
+              carries no schema hash. When the file's .pdxfs metadata
+              declares no schema, `cat` does NOT refuse — it falls
+              back to `RawByteChunk@0.1` emission so a downstream
+              consumer can still window the stream by byte range.
+              (Corrected per ENH-005: this flag never exits non-zero
+              on its own account; the previous "refuses (exit 2) if
+              the file has no readable .pdxfs metadata" text
+              contradicted the fallback described in `.SECTION
+              Semantic pipe layout` below and was never what the
+              implementation did.)
+
+  --version   Print "cat (paideia-os) 1.0.0" and exit 0. Only
+              recognized as the sole argument (argc == 2); combined
+              with any other flag or positional it is treated as an
+              unrecognized long flag by the normal parser (exit 2).
 .END-SECTION
 
 .SECTION Capabilities
