@@ -1,4 +1,4 @@
-// src/entry.pdx — cat.v1.1-A (paideia-os/cat)
+// src/entry.pdx — cat.v1.1.1-A (paideia-os/cat)
 // Entry module: process entry point with REAL sys_open/sys_read/
 // sys_write/sys_close syscalls. Retires the M1-001 STUB chain by
 // bypassing cat_dispatch entirely and inlining the byte-pump loop
@@ -23,6 +23,57 @@
 // real substrate in a later v1.1-B milestone (see enhancement-plan.md
 // §3(b); cat_pdxdoc updates track separately).
 //
+// v1.1.1-A patch — ENH-003 (#23) stderr diagnostics
+// -------------------------------------------------
+// v1.1.0-A collapsed EVERY open failure to `cat: <path>: not found\n`
+// and swallowed sys_read errors as EOF, then exited 0 unconditionally.
+// This patch closes ENH-003 (#23) with per-failure-mode diagnostics
+// and a POSIX-shaped exit code (0 iff every source succeeded, 1
+// otherwise):
+//
+//   Open failure (sys_open < 0) — errno-mapped:
+//     -ENOENT (-2)  -> `cat: <path>: No such file or directory\n`
+//     -EIO    (-5)  -> `cat: <path>: Input/output error\n`
+//     -EACCES (-13) -> `cat: <path>: Permission denied\n`
+//     -EFAULT (-14) -> `cat: <path>: Bad address\n`
+//     -EPERM  (-1)  -> `cat: <path>: denied by capability policy\n`
+//                       (the reserved wording for any sys_cap_invoke
+//                       denial the syscall shim's cap gate may raise;
+//                       distinguished from EACCES which is FS-level
+//                       permission, not capability policy)
+//     default       -> `cat: <path>: unknown error\n`
+//
+//   Read failure mid-copy (sys_read < 0, distinguished from EOF):
+//     -> `cat: <path>: I/O error\n`
+//     Still terminates THIS file's read loop cleanly and moves to the
+//     next positional (no attempt to distinguish read errno further
+//     at this milestone — BSD-cat parity).
+//
+// Errno dispatch keeps rax = -errno as a signed negative value and
+// negates it via `xor rcx,rcx; sub rcx, rax` (no `neg` mnemonic used —
+// avoids paideia-as encoder ambiguity), then walks a cmp-chain against
+// positive constants. Every failure path sets `rbx = 1` (had_error
+// flag, callee-save-preserved across every nested call). Final
+// `sys_exit(rbx)` yields 0 on clean and 1 on any diagnostic fired.
+//
+// The diagnostic composer is factored into two internal helpers:
+//   entry_strlen_nul(path)                -> len   (leaf, same shape
+//                                                    as rm 1.0.1's
+//                                                    Print::strlen_nul)
+//   entry_emit_diag(path, msg_ptr, msg_len) -> ()  (writes "cat: " +
+//                                                    path + msg on
+//                                                    fd 2 via three
+//                                                    sys_writes; msg
+//                                                    itself carries
+//                                                    the leading ": "
+//                                                    and trailing "\n")
+//
+// _start gains a `sub rsp, 8` alignment prologue: execve delivers
+// rsp % 16 == 8 (post-CALL SysV state — verified against rm/main.pdx's
+// 2-push + sub-8 prologue), and the new `call entry_emit_diag` sites
+// need rsp % 16 == 0 at the call boundary. Since _start ends in
+// sys_exit and never returns, the pad is never restored.
+//
 // SC+ ID discipline (frozen per R17-M1-001 / paideia-as #610,
 // sourced from paideia-os/src/user/syscall_shim.pdx):
 //   0  = sys_read(fd, buf, count)      -> count read or -errno
@@ -31,25 +82,32 @@
 //   3  = sys_close(fd)                 -> 0 or -errno
 //   60 = sys_exit(status)              -> never returns
 //
-// Behavior (v1.1-A)
-// -----------------
+// Behavior (v1.1.1-A)
+// -------------------
 //   - argc <= 1 (no positionals): read stdin (fd 0) → write stdout
-//     (fd 1) in 4096-byte chunks until EOF (n <= 0).
+//     (fd 1) in 4096-byte chunks until EOF (n == 0). On sys_read
+//     failure (n < 0) fire cat_msg_ioerror on fd 2 (path = "<stdin>")
+//     and set had_error.
 //   - argc > 1: for each argv[i] with i in [1, argc):
 //       - sys_open(path, O_RDONLY=0, mode=0) -> fd
-//       - if fd < 0: write "cat: <path>: not found\n" to fd 2 and
+//       - if fd < 0: dispatch on -errno → per-message stderr write
+//         via entry_emit_diag (see errno table in header); set rbx=1;
 //         continue to next argv[i] (no fd was opened, no close).
-//       - else: loop { n = sys_read(fd, cat_buf, 4096); if n <= 0
+//       - else: loop { n = sys_read(fd, cat_buf, 4096); if n == 0
+//         break; if n < 0 fire cat_msg_ioerror on fd 2, set rbx=1,
 //         break; sys_write(1, cat_buf, n) }; sys_close(fd).
 //   - --version fast path (argc == 2 && argv[1] == "--version"):
 //     sys_write(1, entry_version_msg, 25) then sys_exit(0), never
 //     touching the file loop or stdin loop.
 //   - Any other flag-shaped arg (e.g. "-n", "-A", "--schema") is
 //     passed straight to sys_open which returns -ENOENT — the
-//     stderr diagnostic fires and cat moves to the next positional.
-//     This is a deliberate v1.1-A regression from v1.0's argv
-//     parser (which recognised -n / -A / --schema); the flag layer
-//     re-lands in v1.1-B on top of this substrate.
+//     stderr diagnostic (No such file or directory) fires and cat
+//     moves to the next positional. This is a deliberate v1.1-A
+//     regression from v1.0's argv parser (which recognised -n / -A
+//     / --schema); the flag layer re-lands in v1.1-B on top of this
+//     substrate.
+//   - Exit code: sys_exit(rbx) — 0 iff every file read cleanly, 1
+//     if any diagnostic fired (POSIX cat convention).
 //
 // argc/argv ABI
 // -------------
@@ -58,14 +116,16 @@
 // entry — registers, not the stack. Same posture as the monorepo
 // cat.pdx / true.pdx / echo_client.pdx / child_hello.pdx.
 //
-// Missing-file diagnostic
-// -----------------------
-// stderr write of "cat: <path>: not found\n" is a strictly stronger
-// contract than v1.0's silent exit — matches the monorepo cat.pdx
-// and closes ENH-003 (#23). Any open failure (ENOENT / EACCES /
-// EISDIR / EBADF) surfaces as the same "not found" wording at
-// v1.1-A; wording refinement is out of scope for this milestone.
-// Uses inline strlen (byte scan) on the argv[i] path.
+// Missing-file diagnostic (v1.1.1-A shape)
+// ----------------------------------------
+// Every failure surfaces on fd 2 as `cat: <path>: <reason>\n`. Open
+// failure reason comes from an errno cmp-chain (see header table);
+// mid-copy read failure reason is the fixed string "I/O error";
+// stdin read failure uses the pseudo-path `<stdin>` (staged as a
+// dedicated .rodata blob so the compose helper stays uniform).
+// Composition delegates to entry_emit_diag which does the three
+// sys_writes: `cat: ` prefix, path bytes (length via
+// entry_strlen_nul), then the trailing `: <reason>\n` blob.
 //
 // Retired stub modules (unreachable dead code post-v1.1-A)
 // --------------------------------------------------------
@@ -133,54 +193,240 @@ module Entry = structure {
   pub let mut cat_buf : [u8; 4096] = uninit @align(8)
 
   // ============================================================================
-  // Error-message parts. Split into prefix / suffix so the path
-  // (from argv[i], NUL-terminated) can be spliced in between via an
-  // inline strlen scan. Immutable => .rodata (bundled into the text
-  // PT_LOAD by cat.ld, same as entry_version_msg below).
+  // Error-message parts. The composer emits three sys_writes on fd 2:
+  // `cat_err_prefix` ("cat: "), then the path bytes (length computed
+  // by entry_strlen_nul at diagnostic time), then one of the
+  // `cat_msg_*` suffix blobs — each of which already carries the
+  // leading ": " and the trailing "\n" so the composer stays uniform
+  // across errno branches.
+  //
+  // Every blob is immutable => .rodata, folded into the text PT_LOAD
+  // by cat.ld alongside entry_version_msg below. All literals live on
+  // a single line per tools/verify-fingerprint-coverage.sh's extractor
+  // contract.
+  //
+  // v1.1.1-A (ENH-003 / #23) added the errno-mapped suffixes plus the
+  // read-failure ("I/O error") suffix and the `<stdin>` pseudo-path
+  // used by the stdin-read-failure branch.
   // ============================================================================
   pub let cat_err_prefix : [u8; 6] = "cat: \0"
   pub let cat_err_prefix_len : u64 = 5
 
-  pub let cat_err_suffix : [u8; 13] = ": not found\n\0"
-  pub let cat_err_suffix_len : u64 = 12
+  pub let cat_msg_enoent : [u8; 29] = ": No such file or directory\n\0"
+  pub let cat_msg_enoent_len : u64 = 28
+
+  pub let cat_msg_eio : [u8; 22] = ": Input/output error\n\0"
+  pub let cat_msg_eio_len : u64 = 21
+
+  pub let cat_msg_eacces : [u8; 21] = ": Permission denied\n\0"
+  pub let cat_msg_eacces_len : u64 = 20
+
+  pub let cat_msg_efault : [u8; 15] = ": Bad address\n\0"
+  pub let cat_msg_efault_len : u64 = 14
+
+  pub let cat_msg_eperm : [u8; 31] = ": denied by capability policy\n\0"
+  pub let cat_msg_eperm_len : u64 = 30
+
+  pub let cat_msg_unknown : [u8; 17] = ": unknown error\n\0"
+  pub let cat_msg_unknown_len : u64 = 16
+
+  pub let cat_msg_ioerror : [u8; 13] = ": I/O error\n\0"
+  pub let cat_msg_ioerror_len : u64 = 12
+
+  pub let cat_stdin_path : [u8; 8] = "<stdin>\0"
+  pub let cat_stdin_path_len : u64 = 7
 
   // ============================================================================
-  // "cat (paideia-os) 1.1.0-A\n" — 25 wire bytes + NUL. Immutable
+  // "cat (paideia-os) 1.1.1-A\n" — 25 wire bytes + NUL. Immutable
   // => .rodata, folded into the text PT_LOAD by cat.ld. The -A
   // suffix marks the v1.1 substrate-flip milestone (real syscalls
   // wired; flag layer deferred to v1.1-B). Consumers compare
-  // prefix-only; the "-A" segment is informational.
+  // prefix-only; the "-A" segment is informational. v1.1.1-A adds
+  // the ENH-003 stderr diagnostic layer on top of v1.1.0-A.
   // ============================================================================
-  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.1.0-A\n\0"
+  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.1.1-A\n\0"
   pub let entry_version_msg_len : u64 = 25
+
+  // ============================================================================
+  // entry_strlen_nul(ptr) -> len
+  //
+  // Signature: entry_strlen_nul : (u64) -> u64 !{mem} @{}
+  //   RDI (input):  ptr — NUL-terminated byte string (interior pointer
+  //                       into the process's argv byte-page).
+  //   RAX (output): len — bytes before the terminator (NUL excluded);
+  //                       0 on empty string.
+  //
+  // Byte-loop strlen used by entry_emit_diag to compute the length of
+  // the argv[i] path (or the `<stdin>` pseudo-path) before the fd-2
+  // sys_write. Same idiom as rm 1.0.1's Print::strlen_nul and
+  // mkfs.pdxfs's format_record_strlen: xor rax,rax initialises the
+  // counter; xor rcx,rcx + mov_b rcx,[rdi] loads the current byte
+  // with the paideia-as #1248 mitigation; cmp rcx,0 branches on NUL;
+  // add rax,1 + add rdi,1 advance both counter and cursor.
+  //
+  // Register plan (leaf; no push/pop; only caller-save touched):
+  //   rax = counter (return value)
+  //   rcx = byte load scratch
+  //   rdi = cursor (advances one byte per iteration)
+  //
+  // Labels prefixed entry_strlen_ per the paideia-as reserved-label
+  // discipline (`loop` is a keyword; entry_strlen_head is used
+  // instead of entry_strlen_loop). rsp % 16 == 8 on entry (post-CALL
+  // SysV state) stays 8 with no nested calls, so no alignment pad
+  // is needed.
+  // ============================================================================
+  pub let entry_strlen_nul : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "cat.v1.1.1-A (ENH-003 / #23) entry_strlen_nul. Byte-loop strlen over a NUL-terminated path; returns byte count in rax (NUL excluded). Called from entry_emit_diag to compute the argv[i] path length (or `<stdin>` pseudo-path length) for the fd-2 sys_write. Same idiom as rm 1.0.1's Print::strlen_nul and mkfs.pdxfs's format_record_strlen. xor rax,rax initialises the counter; xor rcx,rcx + mov_b rcx,[rdi] loads the current byte with the paideia-as #1248 mitigation (cmp rcx,0 rather than cmp cl,0 to sidestep the REX.W byte-compare ambiguity); cmp rcx,0 branches on NUL; add rax,1 + add rdi,1 advance both counter and cursor; jmp entry_strlen_head repeats. Leaf function — only caller-save registers touched (rax/rcx/rdi), no push/pop parity, rsp % 16 == 8 on entry stays 8 with no nested calls. Pointer lifetime owned by the caller: the argv byte-page the shell owns bounds the walk. No test mnemonic; every zero-check via cmp reg,0. Labels prefixed entry_strlen_ (paideia-as reserved-label discipline; `loop` is a keyword so entry_strlen_head is used instead of entry_strlen_loop).",
+      block: {
+        xor rax, rax;                       // counter = 0
+      entry_strlen_head:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je entry_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp entry_strlen_head;
+      entry_strlen_done:
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // entry_emit_diag(path, msg_ptr, msg_len) -> ()
+  //
+  // Signature: entry_emit_diag : (u64, u64, u64) -> () !{mem, sysreg} @{fs}
+  //   RDI: path    — NUL-terminated path pointer (argv[i] or cat_stdin_path)
+  //   RSI: msg_ptr — .rodata pointer to one of the cat_msg_* blobs
+  //   RDX: msg_len — length in bytes of the cat_msg_* blob (its
+  //                  _len sibling)
+  //
+  // Composes the fd-2 diagnostic `cat: <path><msg>` (msg already
+  // carries the leading `: ` and the trailing `\n`) via three
+  // sys_writes:
+  //   (a) write(2, cat_err_prefix, 5)
+  //   (b) write(2, path, entry_strlen_nul(path))
+  //   (c) write(2, msg_ptr, msg_len)
+  //
+  // Register plan (3-push callee-save prologue; rsp % 16 == 0 at
+  // every nested call site):
+  //   r12 = path      (preserved across the strlen call so the
+  //                    subsequent write can use it as buf)
+  //   r13 = msg_ptr   (preserved for step c)
+  //   r14 = msg_len   (preserved for step c)
+  //
+  // Entry rsp % 16 == 8 (post-CALL SysV state); 3 pushes (24 bytes)
+  // lands rsp = 8 - 24 = -16 → rsp % 16 == 0 for the nested
+  // entry_strlen_nul call. All three pushed registers are callee-save
+  // under SysV so the caller (_start's file/stdin loops) can rely on
+  // r12/r13/r14 being restored on ret (even though _start itself
+  // uses r13/r14 as the argc/argv registers frozen from execve, they
+  // survive entry_emit_diag intact).
+  //
+  // Return values of the three sys_writes are ignored (defensive
+  // short-write retry is dead code at v1.1-A given the R17 tty0
+  // backing is length-honoring; same posture as the byte-pump loop
+  // in _start).
+  //
+  // Labels prefixed entry_emit_ per the paideia-as reserved-label
+  // discipline. No test mnemonic; every zero-check via cmp reg,0.
+  // ============================================================================
+  pub let entry_emit_diag : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (path: u64) (msg_ptr: u64) (msg_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs},
+      justification: "cat.v1.1.1-A (ENH-003 / #23) entry_emit_diag. Composes the fd-2 diagnostic `cat: <path><msg>` for every failure branch (open-errno dispatch, mid-copy read failure, stdin read failure). msg_ptr points at one of the cat_msg_* .rodata blobs which already carries the leading `: ` and the trailing `\\n`, so the composer stays uniform across errno branches without per-branch string concatenation. Three sys_writes: (a) prefix `cat: ` (5 bytes) from cat_err_prefix, (b) path bytes with length from entry_strlen_nul (called with rdi=path; rax=len; then rdx=rax, rsi=path, rdi=2, rax=SYS_WRITE=1, syscall), (c) msg_ptr for msg_len bytes. sys_write return ignored per the same posture as _start's byte-pump loop (R17 tty0 is length-honoring; short-write retry would be defensive dead code at this milestone). 3-push callee-save prologue: r12=path (survives strlen call so step (b) can use it as buf), r13=msg_ptr (survives for step (c)), r14=msg_len (survives for step (c)). Entry rsp%16==8 (post-CALL SysV); 3 pushes (24 bytes) lands rsp%16==0 at the nested entry_strlen_nul call site. r12/r13/r14 are all callee-save so the caller's own use of them (_start's r13=argc, r14=argv) is preserved on ret. Encoder guardrails: no test mnemonic (every zero-check via cmp reg,0 — though no zero-checks fire on this hot path); all cmp immediates ≤ 4096 (SC+ IDs); string literals unused inside the body itself. Labels prefixed entry_emit_ per the paideia-as reserved-label discipline.",
+      block: {
+        // ---- prologue: 3 pushes for 16-byte alignment at strlen call ----
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                       // r12 = path
+        mov r13, rsi;                       // r13 = msg_ptr
+        mov r14, rdx;                       // r14 = msg_len
+
+        // ---- (a) sys_write(2, cat_err_prefix, 5). SC+ ID 1. ----
+        mov rdi, 2;
+        lea rsi, [rip + cat_err_prefix];
+        mov rdx, 5;
+        mov rax, 1;
+        syscall;
+
+        // ---- (b) sys_write(2, path, strlen(path)). SC+ ID 1. ----
+        mov rdi, r12;
+        call entry_strlen_nul;              // rax = strlen(path)
+        mov rdx, rax;                       // count = strlen (before rax clobber)
+        mov rsi, r12;                       // buf  = path
+        mov rdi, 2;                         // fd   = stderr
+        mov rax, 1;                         // SYS_WRITE
+        syscall;
+
+        // ---- (c) sys_write(2, msg_ptr, msg_len). SC+ ID 1. ----
+        mov rdi, 2;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rax, 1;
+        syscall;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      }
+    }
 
   // ============================================================================
   // _start — process entry point. Never returns.
   //
   // Register plan (all callee-save, freely clobbered under @no_frame):
+  //   rbx = had_error flag (0 = clean, 1 = ≥1 diagnostic fired).
+  //         Preserved across every entry_emit_diag call (SysV
+  //         callee-save; the helper never touches rbx). Consumed by
+  //         the final sys_exit — the process exits with rbx as the
+  //         status byte (0 on clean, 1 on any failure).
   //   r12 = fd (current open file, valid inside the read/write loop)
-  //   r13 = argc (loaded once from rdi, frozen execve ABI register)
-  //   r14 = argv (loaded once from rsi, frozen execve ABI register)
-  //   r15 = i (current argv index; starts at 1, advances by 1 per arg)
-  //
-  //   rbx = per-arg path pointer (error path only, so the strlen
-  //         scan can walk it without clobbering the loop registers)
-  //   rcx = strlen counter (error path only)
+  //   r13 = argc (loaded once from rdi, frozen execve ABI register).
+  //         Preserved across entry_emit_diag (which push/pops r13).
+  //   r14 = argv (loaded once from rsi, frozen execve ABI register).
+  //         Preserved across entry_emit_diag (which push/pops r14).
+  //   r15 = i (current argv index; starts at 1, advances by 1 per arg).
+  //         Callee-save under SysV; preserved across every call.
   //   r10 = argv[1] pointer, --version fast-path only
+  //   rcx = scratch (negation of errno, per-branch)
+  //
+  // Alignment: execve delivers rsp % 16 == 8 (post-CALL SysV state,
+  // verified against rm/main.pdx's 2-push + sub-8 prologue). The
+  // v1.1.1-A patch adds `call entry_emit_diag` sites which need
+  // rsp % 16 == 0 at the call boundary, so _start prologue includes
+  // a `sub rsp, 8` alignment pad. _start ends in sys_exit and never
+  // returns, so the pad is never restored (matches the @no_frame
+  // posture — no callee-save contract to honour).
   //
   // Effects: {mem, sysreg} — mem for the register-to-register argc/
-  //   argv shuffle, cat_buf staging, and the version-string byte
-  //   compares; sysreg for every raw `syscall`.
+  //   argv shuffle, cat_buf staging, the version-string byte compares,
+  //   and the errno cmp-chain; sysreg for every raw `syscall`.
   // Caps: @{fs, sched} — fs for sys_read / sys_write / sys_open /
   //   sys_close (all fs-gated in the shim); sched for sys_exit's
-  //   task teardown.
+  //   task teardown. entry_emit_diag inherits @{fs}.
   // ============================================================================
   pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "cat.v1.1-A (paideia-os/cat) _start. Substrate flip: retires the M1-001 STUB chain by inlining the four SC+ syscalls it needs (read=0, write=1, open=2, close=3, exit=60) directly in _start rather than calling cat_dispatch (which routes through file_open / file_read_chunk / tty_write_bytes stubs). Sequence: (1) mov r13, rdi (argc); mov r14, rsi (argv) per the frozen execve ABI (design/user/execve-abi.md — registers, not the stack). (2) --version fast path: if argc == 2, load argv[1] into r10, byte-compare against '--version\\0' (10 bytes including NUL) using the xor rax,rax + mov_b + cmp rax, imm pattern (#1248 workaround). Exact match -> sys_write(1, entry_version_msg, 25); sys_exit(0), never touching the file loop. Any mismatch (wrong argc, wrong bytes, or any byte position) falls through to entry_after_version. (3) If argc < 2, jmp entry_stdin_loop (v1.1-A: zero positionals = stdin passthrough). (4) Otherwise mov r15, 1 (i = 1, skip argv[0] = program name) and enter entry_arg_loop. (5) entry_arg_loop: cmp r15, r13; jge entry_done when out of args. (6) sys_open(argv[r15], O_RDONLY=0, mode=0) — rdi = [r14 + r15*8] (SIB scale-8 argv indexing, same shape as monorepo cat.pdx / dispatch.pdx builtin-table walks), rsi = 0, rdx = 0, rax = 2, syscall. rax = fd or -errno. (7) On rax < 0 (cmp rax, 0; jl): entry_open_err writes 'cat: ' (5 bytes to fd 2) + path bytes (strlen-computed via inline byte-loop with xor rax,rax; mov_b rax, [rbx+rcx*1]; cmp rax, 0 pattern) + ': not found\\n' (12 bytes to fd 2), then jmp entry_arg_next. No fd was opened -> no sys_close on the error path. Any open failure (ENOENT / EACCES / EISDIR / EBADF) surfaces as the same 'not found' wording at v1.1-A (POSIX-compatible superset; wording refinement out of scope). (8) On rax >= 0: mov r12, rax (r12 = fd), enter entry_read_loop. (9) sys_read(r12, cat_buf, 4096) — rdi = r12, rsi = &cat_buf (lea rip-relative), rdx = 4096, rax = 0, syscall. rax = n or 0 (EOF) or -errno. (10) If rax <= 0 (cmp rax, 0; jle): jmp entry_read_done — both EOF and I/O error terminate the read loop cleanly, matching BSD cat's exit-status discipline (GNU cat is stricter but out of scope). (11) Otherwise sys_write(1, cat_buf, rax) — mov rdx, rax BEFORE the rax clobber, then rdi = 1, rsi = &cat_buf, rax = 1, syscall. Return value ignored (short-write retry is defensive dead code at v1.1-A given the R17 tty0 backing is length-honoring; same posture as monorepo cat.pdx). jmp entry_read_loop. (12) entry_read_done: sys_close(r12) — rdi = r12, rax = 3, syscall (return ignored, matches BSD cat + init.pdx sys_close discipline). jmp entry_arg_next. (13) entry_arg_next: add r15, 1; jmp entry_arg_loop. (14) entry_stdin_loop: sys_read(0, cat_buf, 4096) — rdi = 0 (fd stdin), rsi = &cat_buf, rdx = 4096, rax = 0, syscall. If rax <= 0 -> entry_done (EOF or error terminates cleanly). Otherwise sys_write(1, cat_buf, rax) and loop. (15) entry_done: sys_exit(0) — rdi = 0, rax = 60, syscall (never returns). Defensive hlt for the impossible fallthrough. @no_frame because _start ends in sys_exit and never returns — the SysV callee-save contract does not apply (same posture as monorepo cat.pdx / true.pdx / echo_client.pdx / child_hello.pdx). All labels prefixed `entry_` per the paideia-as reserved-word discipline. All `cmp reg, imm` immediates ≤ 4096 (SC+ IDs, argc guard, byte-value compares). Byte loads use xor rax,rax + mov_b (#1248). String literals on single lines (fingerprint-extractor requirement).",
+      justification: "cat.v1.1.1-A (paideia-os/cat) _start. v1.1.1-A closes ENH-003 (#23): stderr diagnostics on open failure (errno-mapped), cap denial (EPERM -> `denied by capability policy`), and mid-copy sys_read I/O error; exit code 0 iff every source succeeded, 1 otherwise (POSIX cat convention). Preserves the v1.1.0-A substrate: inlines the four SC+ syscalls it needs (read=0, write=1, open=2, close=3, exit=60) directly in _start rather than calling cat_dispatch. Sequence: (0) sub rsp, 8 — align rsp for the entry_emit_diag call sites (execve delivers rsp%16==8 per rm/main.pdx precedent; -8 yields 0 for SysV CALL). xor rbx, rbx — had_error flag = 0. (1) mov r13, rdi (argc); mov r14, rsi (argv) per the frozen execve ABI (design/user/execve-abi.md — registers, not the stack). (2) --version fast path: if argc == 2, load argv[1] into r10, byte-compare against '--version\\0' (10 bytes including NUL) using the xor rax,rax + mov_b + cmp rax, imm pattern (#1248 workaround). Exact match -> sys_write(1, entry_version_msg, 25); sys_exit(0), never touching the file loop. Any mismatch falls through to entry_after_version. (3) If argc < 2, jmp entry_stdin_loop (v1.1-A: zero positionals = stdin passthrough). (4) Otherwise mov r15, 1 (i = 1, skip argv[0] = program name) and enter entry_arg_loop. (5) entry_arg_loop: cmp r15, r13; jge entry_done when out of args. (6) sys_open(argv[r15], O_RDONLY=0, mode=0) — rdi = [r14 + r15*8] (SIB scale-8 argv indexing), rsi = 0, rdx = 0, rax = 2, syscall. rax = fd or -errno. (7) On rax < 0 (cmp rax, 0; jl): entry_open_err negates rax via xor rcx,rcx; sub rcx, rax; mov rax, rcx (no `neg` mnemonic — avoids paideia-as encoder ambiguity), then dispatches through a cmp-chain against positive errno values (2=ENOENT, 5=EIO, 13=EACCES, 14=EFAULT, 1=EPERM) to select the right cat_msg_* blob. Each branch loads (rdi=path, rsi=&cat_msg_*, rdx=len) then calls entry_emit_diag which composes the three fd-2 sys_writes (`cat: ` + path + `: <reason>\\n`). Every branch sets rbx=1 (had_error). Default (no match) uses cat_msg_unknown. Then jmp entry_arg_next. No fd was opened -> no sys_close on the error path. -EPERM is the reserved wording for any sys_cap_invoke cap denial the syscall shim's cap gate may raise; distinguished from -EACCES which is filesystem-level permission (not capability policy). (8) On rax >= 0: mov r12, rax (r12 = fd), enter entry_read_loop. (9) sys_read(r12, cat_buf, 4096) — rdi = r12, rsi = &cat_buf, rdx = 4096, rax = 0, syscall. rax = n or 0 (EOF) or -errno. (10) cmp rax, 0; je entry_read_done (EOF, clean); jl entry_read_err (I/O error); otherwise fall through to write. (11) sys_write(1, cat_buf, rax) — mov rdx, rax BEFORE the rax clobber, then rdi = 1, rsi = &cat_buf, rax = 1, syscall. Return value ignored (short-write retry is defensive dead code at v1.1-A given the R17 tty0 backing is length-honoring). jmp entry_read_loop. (11a) entry_read_err: mov rdi, [r14 + r15*8] (path), lea rsi, [rip + cat_msg_ioerror], mov rdx, 12, call entry_emit_diag; mov rbx, 1 (had_error); fall through to entry_read_done to still close the fd. (12) entry_read_done: sys_close(r12) — rdi = r12, rax = 3, syscall (return ignored, matches BSD cat + init.pdx sys_close discipline). jmp entry_arg_next. (13) entry_arg_next: add r15, 1; jmp entry_arg_loop. (14) entry_stdin_loop: sys_read(0, cat_buf, 4096). rax == 0 -> entry_done (EOF); rax < 0 -> entry_stdin_err (emit cat_msg_ioerror with cat_stdin_path pseudo-path, set rbx=1, jmp entry_done); else sys_write(1, cat_buf, n) and loop. (15) entry_done: sys_exit(rbx) — rdi = rbx (0 on clean, 1 on had_error), rax = 60, syscall (never returns). Defensive hlt for impossible fallthrough. @no_frame because _start ends in sys_exit and never returns — the SysV callee-save contract does not apply. The `sub rsp, 8` alignment pad is never restored. All labels prefixed `entry_` per the paideia-as reserved-word discipline. All `cmp reg, imm` immediates ≤ 4096 (SC+ IDs, argc guard, byte-value compares, positive errno constants ≤ 14). No test mnemonic. No 2-op imul. No `and r11, imm64`. No `neg` mnemonic (errno negation via xor+sub). Byte loads use xor rax,rax + mov_b (#1248). String literals on single lines (fingerprint-extractor requirement).",
       block: {
+        // ---- Step 0: align rsp for entry_emit_diag call sites ------------
+        // execve delivers rsp%16==8 (post-CALL SysV state, verified against
+        // rm/main.pdx's 2-push + sub-8 prologue). -8 yields 0 for CALL.
+        // Never restored — _start ends in sys_exit.
+        sub rsp, 8;
+
+        // ---- had_error flag init: rbx = 0 (callee-save, survives calls) --
+        xor rbx, rbx;
+
         // ---- Step 1: read argc/argv from the frozen execve ABI regs ----
         mov r13, rdi;                       // r13 = argc
         mov r14, rsi;                       // r14 = argv
@@ -251,9 +497,10 @@ module Entry = structure {
         syscall;
         // rax = n (bytes read), 0 (EOF), or -errno.
 
-        // n <= 0 -> stop reading this file (EOF or error).
+        // n == 0 -> EOF (clean). n < 0 -> I/O error branch.
         cmp rax, 0;
-        jle entry_read_done;
+        je entry_read_done;
+        jl entry_read_err;
 
         // ---- Step 7: sys_write(1, cat_buf, n). SC+ ID 1. ----
         mov rdx, rax;                       // count = n (before rax clobber)
@@ -265,6 +512,16 @@ module Entry = structure {
 
         jmp entry_read_loop;
 
+      entry_read_err:
+        // ---- I/O error mid-copy: `cat: <path>: I/O error\n` to fd 2 -----
+        mov rdi, [r14 + r15*8];             // rdi = path (argv[i])
+        lea rsi, [rip + cat_msg_ioerror];   // rsi = msg
+        mov rdx, 12;                        // rdx = msg_len
+        call entry_emit_diag;
+        mov rbx, 1;                         // had_error = 1
+
+        // Fall through to entry_read_done to still close the fd.
+
       entry_read_done:
         // ---- Step 8: sys_close(fd). SC+ ID 3. ----
         mov rdi, r12;                       // fd
@@ -275,47 +532,70 @@ module Entry = structure {
         jmp entry_arg_next;
 
       entry_open_err:
-        // ---- Error branch: "cat: <path>: not found\n" to fd 2 ------------
+        // ---- Open failure: dispatch on -errno to select the msg ---------
         //
-        // (a) Write "cat: " prefix (5 bytes).
-        mov rdi, 2;                         // fd = stderr
-        lea rsi, [rip + cat_err_prefix];    // buf
-        mov rdx, 5;                         // count
-        mov rax, 1;                         // SC+ ID 1 = sys_write
-        syscall;
+        // Negate rax to get positive errno. No `neg` mnemonic (avoids
+        // paideia-as encoder ambiguity); use xor+sub instead.
+        xor rcx, rcx;
+        sub rcx, rax;                       // rcx = 0 - (-errno) = errno
+        mov rax, rcx;                       // rax = |errno|
 
-        // (b) Inline strlen(argv[i]) so we can write the path bytes.
-        //     rbx = path pointer, rcx = byte counter. Uses the
-        //     xor rax,rax + mov_b rax, [rbx+rcx*1] + cmp rax, 0
-        //     pattern to sidestep paideia-as #1248 (cmp al, imm8
-        //     REX.W ambiguity).
-        mov rbx, [r14 + r15*8];             // rbx = path (char*)
-        xor rcx, rcx;                       // rcx = idx = 0
+        // Load path once into rdi (all branches use it as arg 1).
+        mov rdi, [r14 + r15*8];             // rdi = path (argv[i])
 
-      entry_strlen_loop:
-        xor rax, rax;                       // clear upper bits before byte load
-        mov_b rax, [rbx + rcx*1];           // rax = *(u8*)(rbx + rcx), zero-ext
-        cmp rax, 0;                         // NUL?
-        je  entry_strlen_done;
-        add rcx, 1;
-        jmp entry_strlen_loop;
+        cmp rax, 2;                         // ENOENT
+        je entry_open_err_enoent;
+        cmp rax, 5;                         // EIO
+        je entry_open_err_eio;
+        cmp rax, 13;                        // EACCES
+        je entry_open_err_eacces;
+        cmp rax, 14;                        // EFAULT
+        je entry_open_err_efault;
+        cmp rax, 1;                         // EPERM (cap-denied)
+        je entry_open_err_eperm;
+        jmp entry_open_err_unknown;
 
-      entry_strlen_done:
-        // (c) Write path bytes (rcx of them) to fd 2.
-        mov rdi, 2;                         // fd = stderr
-        mov rsi, rbx;                       // buf = path
-        mov rdx, rcx;                       // count = strlen(path)
-        mov rax, 1;                         // SC+ ID 1 = sys_write
-        syscall;
+      entry_open_err_enoent:
+        lea rsi, [rip + cat_msg_enoent];
+        mov rdx, 28;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
 
-        // (d) Write ": not found\n" suffix (12 bytes).
-        mov rdi, 2;                         // fd = stderr
-        lea rsi, [rip + cat_err_suffix];    // buf
-        mov rdx, 12;                        // count
-        mov rax, 1;                         // SC+ ID 1 = sys_write
-        syscall;
+      entry_open_err_eio:
+        lea rsi, [rip + cat_msg_eio];
+        mov rdx, 21;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
 
-        // Fall through to entry_arg_next -- do NOT close (no fd opened).
+      entry_open_err_eacces:
+        lea rsi, [rip + cat_msg_eacces];
+        mov rdx, 20;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
+
+      entry_open_err_efault:
+        lea rsi, [rip + cat_msg_efault];
+        mov rdx, 14;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
+
+      entry_open_err_eperm:
+        lea rsi, [rip + cat_msg_eperm];
+        mov rdx, 30;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
+
+      entry_open_err_unknown:
+        lea rsi, [rip + cat_msg_unknown];
+        mov rdx, 16;
+        call entry_emit_diag;
+        mov rbx, 1;
+        jmp entry_arg_next;
 
       entry_arg_next:
         add r15, 1;                         // i += 1
@@ -326,6 +606,9 @@ module Entry = structure {
         //   Reads fd 0 in 4096-byte chunks -> writes fd 1 until EOF.
         //   Matches the v1.1-A behavior clause: 'If argv empty, cat
         //   stdin (fd 0) to stdout (fd 1)'.
+        //   v1.1.1-A: distinguish EOF (rax == 0) from I/O error
+        //   (rax < 0). Error path emits cat_msg_ioerror with the
+        //   cat_stdin_path pseudo-path and sets had_error.
         // ==============================================================
       entry_stdin_loop:
         // sys_read(0, cat_buf, 4096). SC+ ID 0.
@@ -337,7 +620,8 @@ module Entry = structure {
         // rax = n or 0 (EOF) or -errno.
 
         cmp rax, 0;
-        jle entry_done;                     // EOF or error terminates cleanly
+        je entry_done;                      // clean EOF
+        jl entry_stdin_err;                 // I/O error
 
         // sys_write(1, cat_buf, n). SC+ ID 1.
         mov rdx, rax;                       // count = n (before rax clobber)
@@ -348,9 +632,19 @@ module Entry = structure {
 
         jmp entry_stdin_loop;
 
+      entry_stdin_err:
+        lea rdi, [rip + cat_stdin_path];    // rdi = "<stdin>"
+        lea rsi, [rip + cat_msg_ioerror];   // rsi = msg
+        mov rdx, 12;                        // rdx = msg_len
+        call entry_emit_diag;
+        mov rbx, 1;                         // had_error = 1
+        jmp entry_done;
+
       entry_done:
-        // ---- Step 9: sys_exit(0). SC+ ID 60. Never returns. ----
-        xor rdi, rdi;                       // status = 0 (OK)
+        // ---- Step 9: sys_exit(rbx). SC+ ID 60. Never returns. ----
+        // rbx carries the exit status: 0 iff every file/stdin read
+        // succeeded, 1 if any diagnostic fired (POSIX cat convention).
+        mov rdi, rbx;                       // status = had_error flag
         mov rax, 60;                        // SC+ ID 60 = sys_exit
         syscall;
 

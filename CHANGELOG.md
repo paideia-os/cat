@@ -11,6 +11,92 @@ M5 dual-signed released.
 
 ---
 
+## v1.1.1-A — 2026-09-12 (ENH-003 stderr diagnostics)
+
+Patch release closing enhancement-v1.x issue #23 (`cat.ENH-003`).
+The v1.1.0-A silent-failure hole is closed: cat now emits
+`cat: <path>: <reason>\n` on fd 2 for every failure mode and exits
+with `0` iff every source succeeded, `1` otherwise (POSIX `cat`
+convention). Replaces v1.1.0-A's collapse-every-failure-to-`not
+found`-then-`exit(0)` posture.
+
+### Landed
+
+- **cat.ENH-003 (issue #23)** — per-mode stderr diagnostics + POSIX
+  exit code.
+  - `src/entry.pdx`
+    - Retired the single `: not found\n` suffix. Replaced it with
+      an errno-mapped `.rodata` table and a mid-copy read-failure
+      blob:
+      - `cat_msg_enoent`  — `: No such file or directory\n` (-ENOENT)
+      - `cat_msg_eio`     — `: Input/output error\n`        (-EIO)
+      - `cat_msg_eacces`  — `: Permission denied\n`         (-EACCES)
+      - `cat_msg_efault`  — `: Bad address\n`               (-EFAULT)
+      - `cat_msg_eperm`   — `: denied by capability policy\n` (-EPERM,
+                            the reserved wording for any future
+                            `sys_cap_invoke` cap denial — distinct
+                            from EACCES, which is filesystem-level
+                            permission, not capability policy)
+      - `cat_msg_unknown` — `: unknown error\n`             (default)
+      - `cat_msg_ioerror` — `: I/O error\n`                 (sys_read
+                            failure mid-copy)
+      - `cat_stdin_path`  — `<stdin>` pseudo-path for the stdin-read
+                            error branch
+    - Added `entry_strlen_nul(ptr) -> len` leaf helper — same shape
+      as rm 1.0.1's `Print::strlen_nul` and mkfs.pdxfs's
+      `format_record_strlen`. Used by the diagnostic composer to
+      compute path length without repeating the inline byte-loop.
+    - Added `entry_emit_diag(path, msg_ptr, msg_len)` composer —
+      three fd-2 `sys_write`s (`cat: ` prefix + path + msg blob).
+      3-push callee-save prologue keeps `rsp % 16 == 0` at the
+      nested `entry_strlen_nul` call site.
+    - `_start` rewrite: `sub rsp, 8` alignment prologue for the
+      new `call entry_emit_diag` sites (execve delivers `rsp%16==8`
+      per rm/main.pdx precedent). `xor rbx, rbx` initialises the
+      `had_error` flag; every failure path sets `rbx = 1`. Errno
+      dispatch negates `rax` via `xor rcx,rcx; sub rcx, rax; mov
+      rax, rcx` (no `neg` mnemonic — avoids paideia-as encoder
+      ambiguity), then walks a `cmp`-chain against positive errno
+      constants (2 / 5 / 13 / 14 / 1). Sys_read return now
+      distinguishes `n == 0` (clean EOF) from `n < 0` (I/O error);
+      the error branch calls `entry_emit_diag` with `cat_msg_ioerror`
+      before falling through to `sys_close`. Stdin-read path gains
+      the same distinction with `cat_stdin_path` as the pseudo-path.
+      Final `sys_exit(rbx)` yields `0` on clean and `1` on any
+      diagnostic.
+    - `entry_version_msg` bumped `1.1.0-A` → `1.1.1-A` (25 wire
+      bytes preserved).
+  - Encoder discipline held throughout:
+    - No `test rN` (every zero-check is `cmp reg, 0`).
+    - No 2-op `imul r, imm`.
+    - No `and r11, imm64`.
+    - No `neg` mnemonic (errno negation via `xor + sub`).
+    - Every `cmp reg, imm` immediate ≤ 4096 (SC+ IDs 0-60, argc
+      guards, byte-value compares, positive errno constants ≤ 14).
+    - Every string literal on a single line
+      (tools/verify-fingerprint-coverage.sh extractor requirement).
+    - Every label prefixed `entry_` (paideia-as reserved-word
+      discipline; `loop` is a keyword).
+    - Byte loads use `xor rax,rax; mov_b rax, [ptr]` (#1248
+      mitigation).
+
+### Fingerprint
+
+- `cat /nonexistent` writes `cat: /nonexistent: No such file or
+  directory\n` to fd 2 and exits `1`.
+- `cat /root/perm-denied` writes `cat: /root/perm-denied: Permission
+  denied\n` (or `denied by capability policy\n` for a cap-gated
+  refusal) to fd 2 and exits `1`.
+- `cat /dev/read-fails` (successful open, read fails) writes what
+  was already copied to fd 1, then `cat: /dev/read-fails: I/O
+  error\n` to fd 2, closes the fd, and continues to the next
+  positional; the whole invocation exits `1`.
+- `cat existing missing` writes `existing`'s contents to fd 1, then
+  `cat: missing: No such file or directory\n` to fd 2, exits `1`.
+- `cat existing` (every source succeeds) exits `0` — unchanged.
+
+---
+
 ## v1.0.0 — 2026-08-22 (M5 close, first signed release)
 
 First 1.0. Dual-signed manifest, `.pdxdoc` for `doc cat`, and mirror

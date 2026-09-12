@@ -46,6 +46,7 @@ Landed so far:
 | ID       | #   | Title                                                          | State  |
 |----------|-----|-----------------------------------------------------------------|--------|
 | ENH-001  | #17 | `_start` + `cat.ld` linker script + linked `cat.elf`            | LANDED (partial — see note) |
+| ENH-003  | #23 | stderr diagnostics on open failure / cap denial / I/O error    | LANDED (v1.1.1-A) |
 | ENH-005  | #20 | Wire `--version`; strip `--help`; fix `--schema` text           | LANDED |
 | ENH-006  | #18 | Correct the libpdx-argv claim in STATUS.md                      | LANDED |
 | ENH-009  | #19 | Raise `NAME_MAX_LEN` from 236 to 255                            | LANDED |
@@ -66,9 +67,9 @@ returns 0 → exit 4 for every real path). `--version` and the
 usage-error path are real (no stub involved) because they bypass
 `cat_dispatch` entirely.
 
-Remaining open: ENH-002 (#22, cross-repo canonicalization), ENH-003
-(#23, stderr diagnostics — deps on ENH-002's I/O layer being real),
-ENH-004 (#24, 64 KiB sink ceiling — same dependency), ENH-007 (#25,
+Remaining open: ENH-002 (#22, cross-repo canonicalization),
+ENH-004 (#24, 64 KiB sink ceiling — dep now moot on the v1.1-A
+substrate, retracking pending), ENH-007 (#25,
 libpdx-argv migration), ENH-008 (#21, RawByteChunk hash — needs the
 canonical DDL hash value from libpdx-semantic-pipe, not yet
 researched here).
