@@ -49,16 +49,47 @@
 //   rbc_get_offset : () -> u64 !{mem} @{}
 //     RAX: current _rbc_file_offset. M4 test observability.
 //
-// Schema-hash provenance
-// ----------------------
-// RBC_SCHEMA_HASH is a deterministic 32-byte constant standing in
-// for the BLAKE3-truncated fingerprint of the RawByteChunk@0.1
-// schema definition. The v1.0 release (cat.M5) will recompute
-// this from the canonical schema DDL and update the constant;
-// consumers keyed off the M3 placeholder value will need to
-// re-key at that point. Placeholder pattern is a repeating
-// nibble sequence chosen to be trivially spottable in a hex
-// dump.
+// Schema-hash provenance (cat.ENH-008 — canonical DDL hash landed)
+// -----------------------------------------------------------------
+// RBC_SCHEMA_HASH is the 32-byte fingerprint of the canonical
+// RawByteChunk@0.1 DDL:
+//
+//   RawByteChunk@0.1\n
+//   offset:u64\n
+//   bytes:[u8]\n
+//
+// (byte-exact, LF line terminators, no trailing whitespace, no BOM;
+// see tools/compute-schema-hash.py for the reproducing driver).
+//
+// The hash function at this landing is SHA-256, truncated to its full
+// 32-byte digest (no further truncation needed at 32B). The R49-R50
+// design contract (design/tooling/r49-r50-plan.md §"Semantic-pipe /
+// audit integration") names BLAKE3-truncated-to-32-bytes as the final
+// fingerprint kind; no BLAKE3 implementation exists anywhere in the
+// tools tree at HEAD (grep BLAKE3 across tools/user/**/*.pdx returns
+// only design-comment references). Choosing SHA-256 as the interim
+// canonical hash: (a) unblocks the pillar payoff of ENH-008 (a
+// deterministic value derived from a canonical DDL rather than a
+// nibble-hex-dump pattern the source itself flags as a placeholder,
+// carried through a two-signature manifest); (b) preserves the
+// registry-lookup contract shape (32-byte opaque fingerprint keying
+// into the schema-registry service) unchanged; (c) reduces the
+// migration to BLAKE3 to a re-run of tools/compute-schema-hash.py
+// plus the four-qword replacement in rbc_reset below (no consumer
+// signature edit, since RBC_SCHEMA_HASH is emitted verbatim in the
+// R20b IPC frame's schema_hash prefix). The comment header names
+// SHA-256 explicitly so a downstream consumer diffing the hash bytes
+// against BLAKE3(canonical DDL) sees the mismatch immediately.
+//
+// Canonical DDL bytes and hash (reproduce with tools/compute-schema-hash.py):
+//   SHA-256 = ce c3 d6 87 47 89 e0 85 86 ba df c9 35 09 fd 99
+//             34 58 01 ee 2d 52 41 33 06 5e cc f7 d8 54 53 b4
+//
+// Little-endian u64 view (order of stores in rbc_reset):
+//   q0 = 0x85E0894787D6C3CE
+//   q1 = 0x99FD0935C9DFBA86
+//   q2 = 0x3341522DEE015834
+//   q3 = 0xB45354D8F7CC5E06
 //
 // paideia-as compliance
 // ---------------------
@@ -88,13 +119,25 @@ module RawByteChunk = structure {
   pub let RBC_MAX_BODY  : u64 = 4048
 
   // ============================================================================
-  // RBC_SCHEMA_HASH — RawByteChunk@0.1 fingerprint placeholder.
+  // RBC_SCHEMA_HASH — canonical RawByteChunk@0.1 fingerprint (ENH-008).
   //
-  // 32 bytes = 4 u64 words, little-endian pattern. Recomputed at
-  // v1.0 from the canonical schema DDL. Consumers should treat
-  // the M3 value as unstable.
+  // 32 bytes = 4 u64 words, little-endian. Derived from the SHA-256 of
+  // the canonical DDL documented in the module header; reproducible via
+  // tools/compute-schema-hash.py. Migration to BLAKE3-truncated is a
+  // one-tool-rerun + one-block-rewrite in rbc_reset when libpdx-hash
+  // lands. Consumers now key off a value derived from a canonical
+  // input, so the shape of the contract (deterministic-per-DDL) is
+  // frozen even though the specific hash-function choice is not.
   // ============================================================================
   pub let mut _rbc_schema_hash : [u64; 4] = uninit @align(8)
+
+  // Canonical DDL bytes (used by rbc_get_schema_ddl for downstream
+  // consumers and by tools/compute-schema-hash.py at re-derivation time).
+  // Byte-exact and LF-terminated; the trailing NUL is padding for the
+  // Rodata store and is NOT part of the hashed input.
+  pub let RBC_SCHEMA_DDL     : [u8; 41] =
+    "RawByteChunk@0.1\noffset:u64\nbytes:[u8]\n\0"
+  pub let RBC_SCHEMA_DDL_LEN : u64 = 40
 
   // ============================================================================
   // Per-file offset — advanced by rbc_emit_chunk; reset at file
@@ -124,22 +167,23 @@ module RawByteChunk = structure {
   pub let rbc_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "cat.M3-002 rbc_reset. Two responsibilities: (1) install the RawByteChunk@0.1 placeholder schema-hash pattern into _rbc_schema_hash (4 qwords: 0x1111111111111111 / 0x2222222222222222 / 0x3333333333333333 / 0x4444444444444444 — trivially spottable in a hex dump; will be replaced by BLAKE3 fingerprint at v1.0). (2) Zero _rbc_file_offset so the first record of the current file starts at offset 0. Called at the top of every per-file RBC-path inner loop in cat_dispatch. Leaf function; r11 scratch. All immediates fit imm32.",
+      justification: "cat.ENH-008 rbc_reset (paideia-os/cat#21). Two responsibilities: (1) install the CANONICAL RawByteChunk@0.1 schema-hash into _rbc_schema_hash — the 4-qword LE view of SHA-256(canonical DDL bytes) where the canonical DDL is documented byte-exact in the module header and reproduced by tools/compute-schema-hash.py. Pre-ENH-008 this installed a debug pattern (four qwords of 0x1111…/0x2222…/0x3333…/0x4444…) that leaked through caps.decl `declares_output_schemas: RawByteChunk@0.1` and manifest.pdxsig §5 as an advertised-yet-placeholder fingerprint — a supply-chain-shaped defect. The final BLAKE3-truncated form named in design/tooling/r49-r50-plan.md is a one-tool-rerun swap once libpdx-hash lands (no consumer signature edit, since the four-qword slot is a frozen contract). (2) Zero _rbc_file_offset so the first record of the current file starts at offset 0. Called at the top of every per-file RBC-path inner loop in cat_dispatch. Leaf function; r11 scratch. Every mov rax, imm64 uses movabs (the immediates exceed imm32); every mov [r11 + N], rax is a rip-relative store into the .bss slot at N==0/8/16/24 (all fit imm32).",
       block: {
-        // Install schema-hash placeholder pattern.
-        mov rax, 0x1111111111111111;
+        // Install canonical DDL hash — SHA-256(canonical DDL) as 4 LE qwords.
+        // See module header for canonical DDL and reproducing driver.
+        mov rax, 0x85E0894787D6C3CE;           // q0
         lea r11, [rip + _rbc_schema_hash];
         mov [r11], rax;
 
-        mov rax, 0x2222222222222222;
+        mov rax, 0x99FD0935C9DFBA86;           // q1
         lea r11, [rip + _rbc_schema_hash];
         mov [r11 + 8], rax;
 
-        mov rax, 0x3333333333333333;
+        mov rax, 0x3341522DEE015834;           // q2
         lea r11, [rip + _rbc_schema_hash];
         mov [r11 + 16], rax;
 
-        mov rax, 0x4444444444444444;
+        mov rax, 0xB45354D8F7CC5E06;           // q3
         lea r11, [rip + _rbc_schema_hash];
         mov [r11 + 24], rax;
 
