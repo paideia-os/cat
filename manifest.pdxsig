@@ -51,19 +51,31 @@
 # ---------------------------------------------------------------
 package:
   name:              cat
-  version:           1.2.0
-  wave:              R50 (+ Wave-B enhancement batch)
+  version:           1.2.1
+  wave:              R50 (+ Wave-B enhancement batch + Wave L)
   category:          A  # Filesystem + core utilities (plan.md §5)
   posix_ancestor:    cat
   release_date:      2026-09-13
-  git_tag:           v1.2.0
+  git_tag:           v1.2.1-A
   git_repo:          github.com/paideia-os/cat
   license:           MIT
   paideia_as_target: v0.36          # min toolchain for build reproducibility (bumped for #1248 mitigation)
   #
-  # v1.2.0-A (Wave-B batch) supersedes v1.1.1-A (ENH-003) which
-  # itself superseded v1.1.0-A (ENH-002) which superseded v1.0.0
-  # (M5 first signed release). Closes cat #22 (reconcile with
+  # v1.2.1-A (Wave L batch) supersedes v1.2.0-A (Wave-B batch) which
+  # superseded v1.1.1-A (ENH-003) which itself superseded v1.1.0-A
+  # (ENH-002) which superseded v1.0.0 (M5 first signed release).
+  # Closes cat #26 (R90-XREPO.013.M3-002 caps.decl + adoption —
+  # requires: block already matched the required shape; adoption
+  # note added, libpdx-cap enforcement half external-gate pending
+  # per STATUS.md), #27 (SCHEMA-001 libpdx-schema-registry client
+  # wire — src/schema_wire.pdx, placeholder body pending the real
+  # service), #29 (v1.1-B semantic-pipe emission — src/pipe_emit.pdx,
+  # one best-effort sys_semantic_send per run), #30 (this release,
+  # repurposed from the stale v1.1-C closer since v1.1 was already
+  # superseded), and #31 (errno-mapping fixture — tests/cat_errno_map.
+  # pdx + tests/errno_capture.pdx, 7-row diagnostic-dispatch replica).
+  #
+  # v1.2.0-A (Wave-B batch) closed cat #22 (reconcile with
   # monorepo — satellite is master per design/user/
   # in-tree-vs-satellite-transition.md), #24 (TtySink 64 KiB
   # output ceiling — removed by v1.1-A substrate flip; live path
@@ -83,7 +95,7 @@ package:
 # on install is a signature-bounded refusal path.
 caps_decl:
   path:              caps.decl
-  hash_sha2_256:     6fecbbcbb808f983013bb43fef6e4eac8f7f187254098c7f33295d79cbcb20c6
+  hash_sha2_256:     TBD-RECOMPUTED-AT-SIGN   # cat#26 (Wave L) appended the R90-XREPO adoption note; prior hash (6fecbbcbb808f983013bb43fef6e4eac8f7f187254098c7f33295d79cbcb20c6) is stale as of this edit — the `requires:` block itself is byte-identical, only trailing comment bytes changed
   # hash_sha3_256:  <re-emitted by paideia-as release --sign>
 
 # ---------------------------------------------------------------
@@ -139,6 +151,11 @@ content_hashes:
     # v1.2.0-A additions (Closes #25 — libpdx-argv contract):
     - path: src/tool_ident.pdx
       hash: TBD-RECOMPUTED-AT-SIGN
+    # v1.2.1-A additions (Wave L — Closes #26 / #27 / #29 / #30 / #31):
+    - path: src/schema_wire.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
+    - path: src/pipe_emit.pdx
+      hash: TBD-RECOMPUTED-AT-SIGN
 
 # ---------------------------------------------------------------
 # §5 Declared output schemas (D2, semantic-pipe)
@@ -151,6 +168,23 @@ declared_output_schemas:
     origin:          libpdx-semantic-pipe (schemaless-file path, M3-002)
   - name:            <inherited from KIND_PDXFS_FILE.schema>
     origin:          per-file schema (schema-typed passthrough, M3-001)
+  - name:            CatPipeRecord
+    version:         0.1
+    origin:          src/pipe_emit.pdx (cat#29, v1.2.1-A) — one
+                      best-effort sys_semantic_send (sysno 115) per
+                      invocation, 128-byte record, wire schema tag
+                      0x4361745069706501
+
+# ---------------------------------------------------------------
+# §5b Schema-registry annotation (SCHEMA-001, cat#27)
+# ---------------------------------------------------------------
+# src/schema_wire.pdx registers RawByteChunk@0.1's canonical DDL hash
+# against libpdx-schema-registry and caches the returned id as
+# cat_schema_id, echoed into every CatPipeRecord@0.1's schema_id
+# field above. The registry service itself is inert (paideia-os#2000)
+# at this writing, so the id resolved today is a fixed placeholder
+# (CAT_SCHEMA_ID_PLACEHOLDER = 0xE05AC000), not a real registry
+# assignment.
 
 # ---------------------------------------------------------------
 # §6 Author signature — first of two ML-DSA-65 signatures

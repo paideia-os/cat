@@ -74,6 +74,30 @@
 // need rsp % 16 == 0 at the call boundary. Since _start ends in
 // sys_exit and never returns, the pad is never restored.
 //
+// v1.2.1-A patch — cat#29 semantic-pipe emission (Wave L)
+// ---------------------------------------------------------
+// Adds a `rbp` accumulator (total bytes successfully written across
+// every file / the stdin pass this run) and one call site at
+// `entry_done`, immediately before `sys_exit`: resolve the last
+// processed path (argv[argc-1], or the `<stdin>` pseudo-path when
+// argc < 2), call `SchemaWire::schema_wire_register` (cat#27) so
+// `cat_schema_id` is fresh, then `PipeEmit::pipe_emit_send(rbp,
+// cat_schema_id, path)` (src/pipe_emit.pdx) to emit one best-effort
+// CatPipeRecord@0.1 via `sys_semantic_send` (sysno 115). Both new
+// calls land at `entry_done`, which every existing exit path already
+// funnels through (arg-loop exhaustion, clean stdin EOF, and the
+// stdin-error branch all `jmp`/fall through to it), so no other label
+// needed a new call site. `rbp` is initialised to 0 alongside `rbx` at
+// the top of `_start` and bumped by `rax` (the write syscall's own
+// return value, guarded non-negative) immediately after each of the
+// two `sys_write(1, cat_buf, ...)` sites — see `entry_wsum_file_skip`
+// / `entry_wsum_stdin_skip`. `rbp` is otherwise unused anywhere in this
+// file (it carries no SysV-mandated role here since `_start` is
+// `@no_frame` and never returns), so repurposing it as a plain GP
+// accumulator needs no save/restore, matching this codebase's existing
+// posture toward `rbp` as an ordinary register outside `@no_frame`-less
+// functions (e.g. shell's test harnesses use it as plain scratch).
+//
 // SC+ ID discipline (frozen per R17-M1-001 / paideia-as #610,
 // sourced from paideia-os/src/user/syscall_shim.pdx):
 //   0  = sys_read(fd, buf, count)      -> count read or -errno
@@ -244,7 +268,7 @@ module Entry = structure {
   // prefix-only; the "-A" segment is informational. v1.1.1-A adds
   // the ENH-003 stderr diagnostic layer on top of v1.1.0-A.
   // ============================================================================
-  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.2.0-A\n\0"
+  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.2.1-A\n\0"
   pub let entry_version_msg_len : u64 = 25
 
   // ============================================================================
@@ -394,6 +418,11 @@ module Entry = structure {
   //         Preserved across entry_emit_diag (which push/pops r14).
   //   r15 = i (current argv index; starts at 1, advances by 1 per arg).
   //         Callee-save under SysV; preserved across every call.
+  //   rbp = total bytes successfully written this run (v1.2.1-A,
+  //         cat#29). Initialised to 0 alongside rbx; bumped by the
+  //         write syscall's own return value (guarded non-negative)
+  //         at both sys_write(1, cat_buf, ...) sites. Consumed at
+  //         entry_done as pipe_emit_send's bytes_written argument.
   //   r10 = argv[1] pointer, --version fast-path only
   //   rcx = scratch (negation of errno, per-branch)
   //
@@ -416,7 +445,7 @@ module Entry = structure {
     fn () -> unsafe {
       effects: {mem, sysreg},
       capabilities: {fs, sched},
-      justification: "cat.v1.1.1-A (paideia-os/cat) _start. v1.1.1-A closes ENH-003 (#23): stderr diagnostics on open failure (errno-mapped), cap denial (EPERM -> `denied by capability policy`), and mid-copy sys_read I/O error; exit code 0 iff every source succeeded, 1 otherwise (POSIX cat convention). Preserves the v1.1.0-A substrate: inlines the four SC+ syscalls it needs (read=0, write=1, open=2, close=3, exit=60) directly in _start rather than calling cat_dispatch. Sequence: (0) sub rsp, 8 — align rsp for the entry_emit_diag call sites (execve delivers rsp%16==8 per rm/main.pdx precedent; -8 yields 0 for SysV CALL). xor rbx, rbx — had_error flag = 0. (1) mov r13, rdi (argc); mov r14, rsi (argv) per the frozen execve ABI (design/user/execve-abi.md — registers, not the stack). (2) --version fast path: if argc == 2, load argv[1] into r10, byte-compare against '--version\\0' (10 bytes including NUL) using the xor rax,rax + mov_b + cmp rax, imm pattern (#1248 workaround). Exact match -> sys_write(1, entry_version_msg, 25); sys_exit(0), never touching the file loop. Any mismatch falls through to entry_after_version. (3) If argc < 2, jmp entry_stdin_loop (v1.1-A: zero positionals = stdin passthrough). (4) Otherwise mov r15, 1 (i = 1, skip argv[0] = program name) and enter entry_arg_loop. (5) entry_arg_loop: cmp r15, r13; jge entry_done when out of args. (6) sys_open(argv[r15], O_RDONLY=0, mode=0) — rdi = [r14 + r15*8] (SIB scale-8 argv indexing), rsi = 0, rdx = 0, rax = 2, syscall. rax = fd or -errno. (7) On rax < 0 (cmp rax, 0; jl): entry_open_err negates rax via xor rcx,rcx; sub rcx, rax; mov rax, rcx (no `neg` mnemonic — avoids paideia-as encoder ambiguity), then dispatches through a cmp-chain against positive errno values (2=ENOENT, 5=EIO, 13=EACCES, 14=EFAULT, 1=EPERM) to select the right cat_msg_* blob. Each branch loads (rdi=path, rsi=&cat_msg_*, rdx=len) then calls entry_emit_diag which composes the three fd-2 sys_writes (`cat: ` + path + `: <reason>\\n`). Every branch sets rbx=1 (had_error). Default (no match) uses cat_msg_unknown. Then jmp entry_arg_next. No fd was opened -> no sys_close on the error path. -EPERM is the reserved wording for any sys_cap_invoke cap denial the syscall shim's cap gate may raise; distinguished from -EACCES which is filesystem-level permission (not capability policy). (8) On rax >= 0: mov r12, rax (r12 = fd), enter entry_read_loop. (9) sys_read(r12, cat_buf, 4096) — rdi = r12, rsi = &cat_buf, rdx = 4096, rax = 0, syscall. rax = n or 0 (EOF) or -errno. (10) cmp rax, 0; je entry_read_done (EOF, clean); jl entry_read_err (I/O error); otherwise fall through to write. (11) sys_write(1, cat_buf, rax) — mov rdx, rax BEFORE the rax clobber, then rdi = 1, rsi = &cat_buf, rax = 1, syscall. Return value ignored (short-write retry is defensive dead code at v1.1-A given the R17 tty0 backing is length-honoring). jmp entry_read_loop. (11a) entry_read_err: mov rdi, [r14 + r15*8] (path), lea rsi, [rip + cat_msg_ioerror], mov rdx, 12, call entry_emit_diag; mov rbx, 1 (had_error); fall through to entry_read_done to still close the fd. (12) entry_read_done: sys_close(r12) — rdi = r12, rax = 3, syscall (return ignored, matches BSD cat + init.pdx sys_close discipline). jmp entry_arg_next. (13) entry_arg_next: add r15, 1; jmp entry_arg_loop. (14) entry_stdin_loop: sys_read(0, cat_buf, 4096). rax == 0 -> entry_done (EOF); rax < 0 -> entry_stdin_err (emit cat_msg_ioerror with cat_stdin_path pseudo-path, set rbx=1, jmp entry_done); else sys_write(1, cat_buf, n) and loop. (15) entry_done: sys_exit(rbx) — rdi = rbx (0 on clean, 1 on had_error), rax = 60, syscall (never returns). Defensive hlt for impossible fallthrough. @no_frame because _start ends in sys_exit and never returns — the SysV callee-save contract does not apply. The `sub rsp, 8` alignment pad is never restored. All labels prefixed `entry_` per the paideia-as reserved-word discipline. All `cmp reg, imm` immediates ≤ 4096 (SC+ IDs, argc guard, byte-value compares, positive errno constants ≤ 14). No test mnemonic. No 2-op imul. No `and r11, imm64`. No `neg` mnemonic (errno negation via xor+sub). Byte loads use xor rax,rax + mov_b (#1248). String literals on single lines (fingerprint-extractor requirement).",
+      justification: "cat.v1.1.1-A (paideia-os/cat) _start. v1.1.1-A closes ENH-003 (#23): stderr diagnostics on open failure (errno-mapped), cap denial (EPERM -> `denied by capability policy`), and mid-copy sys_read I/O error; exit code 0 iff every source succeeded, 1 otherwise (POSIX cat convention). Preserves the v1.1.0-A substrate: inlines the four SC+ syscalls it needs (read=0, write=1, open=2, close=3, exit=60) directly in _start rather than calling cat_dispatch. Sequence: (0) sub rsp, 8 — align rsp for the entry_emit_diag call sites (execve delivers rsp%16==8 per rm/main.pdx precedent; -8 yields 0 for SysV CALL). xor rbx, rbx — had_error flag = 0. (1) mov r13, rdi (argc); mov r14, rsi (argv) per the frozen execve ABI (design/user/execve-abi.md — registers, not the stack). (2) --version fast path: if argc == 2, load argv[1] into r10, byte-compare against '--version\\0' (10 bytes including NUL) using the xor rax,rax + mov_b + cmp rax, imm pattern (#1248 workaround). Exact match -> sys_write(1, entry_version_msg, 25); sys_exit(0), never touching the file loop. Any mismatch falls through to entry_after_version. (3) If argc < 2, jmp entry_stdin_loop (v1.1-A: zero positionals = stdin passthrough). (4) Otherwise mov r15, 1 (i = 1, skip argv[0] = program name) and enter entry_arg_loop. (5) entry_arg_loop: cmp r15, r13; jge entry_done when out of args. (6) sys_open(argv[r15], O_RDONLY=0, mode=0) — rdi = [r14 + r15*8] (SIB scale-8 argv indexing), rsi = 0, rdx = 0, rax = 2, syscall. rax = fd or -errno. (7) On rax < 0 (cmp rax, 0; jl): entry_open_err negates rax via xor rcx,rcx; sub rcx, rax; mov rax, rcx (no `neg` mnemonic — avoids paideia-as encoder ambiguity), then dispatches through a cmp-chain against positive errno values (2=ENOENT, 5=EIO, 13=EACCES, 14=EFAULT, 1=EPERM) to select the right cat_msg_* blob. Each branch loads (rdi=path, rsi=&cat_msg_*, rdx=len) then calls entry_emit_diag which composes the three fd-2 sys_writes (`cat: ` + path + `: <reason>\\n`). Every branch sets rbx=1 (had_error). Default (no match) uses cat_msg_unknown. Then jmp entry_arg_next. No fd was opened -> no sys_close on the error path. -EPERM is the reserved wording for any sys_cap_invoke cap denial the syscall shim's cap gate may raise; distinguished from -EACCES which is filesystem-level permission (not capability policy). (8) On rax >= 0: mov r12, rax (r12 = fd), enter entry_read_loop. (9) sys_read(r12, cat_buf, 4096) — rdi = r12, rsi = &cat_buf, rdx = 4096, rax = 0, syscall. rax = n or 0 (EOF) or -errno. (10) cmp rax, 0; je entry_read_done (EOF, clean); jl entry_read_err (I/O error); otherwise fall through to write. (11) sys_write(1, cat_buf, rax) — mov rdx, rax BEFORE the rax clobber, then rdi = 1, rsi = &cat_buf, rax = 1, syscall. Return value ignored (short-write retry is defensive dead code at v1.1-A given the R17 tty0 backing is length-honoring). jmp entry_read_loop. (11a) entry_read_err: mov rdi, [r14 + r15*8] (path), lea rsi, [rip + cat_msg_ioerror], mov rdx, 12, call entry_emit_diag; mov rbx, 1 (had_error); fall through to entry_read_done to still close the fd. (12) entry_read_done: sys_close(r12) — rdi = r12, rax = 3, syscall (return ignored, matches BSD cat + init.pdx sys_close discipline). jmp entry_arg_next. (13) entry_arg_next: add r15, 1; jmp entry_arg_loop. (14) entry_stdin_loop: sys_read(0, cat_buf, 4096). rax == 0 -> entry_done (EOF); rax < 0 -> entry_stdin_err (emit cat_msg_ioerror with cat_stdin_path pseudo-path, set rbx=1, jmp entry_done); else sys_write(1, cat_buf, n) and loop. (15) entry_done: v1.2.1-A (cat#29) inserts the semantic-pipe emission HERE, before step 9's sys_exit, since every predecessor (arg-loop exhaustion, clean stdin EOF, stdin-error) already funnels through this one label. (15a) cmp r13, 2; jl entry_pipe_path_stdin resolves the path to summarise: argc >= 2 takes r9 = r13 - 1 (via mov+sub, no `sub reg,reg` ambiguity since r13 survives untouched) then r9 = [r14 + r9*8] (argv[argc-1], SIB scale-8 matching the file/argv indexing used throughout this function); argc < 2 takes r9 = &cat_stdin_path instead. (15b) call schema_wire_register (SchemaWire, src/schema_wire.pdx, cat#27) refreshes cat_schema_id; r9/r13/r14/rbx/rbp all survive it untouched (that function only touches rdi/rax/r11 plus a stack-neutral sub/add rsp,8 bracket). (15c) lea r10, [rip + cat_schema_id]; mov rax, [r10] loads the fresh id into rax (a fresh register, not r10 itself, matching this file's own established `lea r11,[sym]; mov rY,[r11]` two-register idiom rather than a self-referential `mov r10,[r10]`). (15d) mov rdi, rbp; mov rsi, rax; mov rdx, r9; call pipe_emit_send (PipeEmit, src/pipe_emit.pdx, cat#29) emits one best-effort CatPipeRecord@0.1 via sys_semantic_send; its return value is discarded exactly like every syscall return in this file's byte-pump loops. Neither new call touches rbx, so step 9 is unaffected. (16) Step 9 (unchanged): sys_exit(rbx) — rdi = rbx (0 on clean, 1 on had_error), rax = 60, syscall (never returns). Defensive hlt for impossible fallthrough. @no_frame because _start ends in sys_exit and never returns — the SysV callee-save contract does not apply. The `sub rsp, 8` alignment pad is never restored (and remains sufficient for the two new call sites at entry_done — no intervening push/pop since step 0 changes rsp's value, so rsp%16==0 holds at every CALL in this function, entry_pipe_path_ready's included). All labels prefixed `entry_` per the paideia-as reserved-word discipline. All `cmp reg, imm` immediates ≤ 4096 (SC+ IDs, argc guard, byte-value compares, positive errno constants ≤ 14). No test mnemonic. No 2-op imul. No `and r11, imm64`. No `neg` mnemonic (errno negation via xor+sub; argc-1 via mov+sub, also not `sub reg,reg`). Byte loads use xor rax,rax + mov_b (#1248). String literals on single lines (fingerprint-extractor requirement). rbp (v1.2.1-A) is initialised to 0 alongside rbx at step 0 and bumped by `cmp rax,0; jl <skip>; add rbp,rax` immediately after each of the two sys_write(1, cat_buf, ...) sites (file-loop step 7 and the stdin loop) — rax there is the write syscall's OWN return value (bytes actually written, or -errno), not the read count, so a partial or failed write contributes correctly (0 or the true partial count) rather than double-counting the read side.",
       block: {
         // ---- Step 0: align rsp for entry_emit_diag call sites ------------
         // execve delivers rsp%16==8 (post-CALL SysV state, verified against
@@ -426,6 +455,9 @@ module Entry = structure {
 
         // ---- had_error flag init: rbx = 0 (callee-save, survives calls) --
         xor rbx, rbx;
+
+        // ---- v1.2.1-A (cat#29): total bytes-written accumulator init ----
+        xor rbp, rbp;
 
         // ---- Step 1: read argc/argv from the frozen execve ABI regs ----
         mov r13, rdi;                       // r13 = argc
@@ -508,7 +540,13 @@ module Entry = structure {
         lea rsi, [rip + cat_buf];           // buf
         mov rax, 1;                         // SC+ ID 1 = sys_write
         syscall;
-        // rax = bytes written or -errno. Ignored per justification.
+        // rax = bytes written or -errno.
+
+        // ---- v1.2.1-A (cat#29): accumulate bytes actually written -------
+        cmp rax, 0;
+        jl entry_wsum_file_skip;
+        add rbp, rax;
+      entry_wsum_file_skip:
 
         jmp entry_read_loop;
 
@@ -630,6 +668,12 @@ module Entry = structure {
         mov rax, 1;                         // SC+ ID 1 = sys_write
         syscall;
 
+        // ---- v1.2.1-A (cat#29): accumulate bytes actually written -------
+        cmp rax, 0;
+        jl entry_wsum_stdin_skip;
+        add rbp, rax;
+      entry_wsum_stdin_skip:
+
         jmp entry_stdin_loop;
 
       entry_stdin_err:
@@ -641,6 +685,26 @@ module Entry = structure {
         jmp entry_done;
 
       entry_done:
+        // ---- v1.2.1-A (cat#29 / #27): best-effort semantic-pipe emission -
+        // Resolve the path to summarise: argc >= 2 -> argv[argc-1]
+        // (last file processed); argc < 2 -> the <stdin> pseudo-path.
+        cmp r13, 2;
+        jl entry_pipe_path_stdin;
+        mov r9, r13;
+        sub r9, 1;                          // r9 = argc - 1
+        mov r9, [r14 + r9*8];               // r9 = argv[argc - 1]
+        jmp entry_pipe_path_ready;
+      entry_pipe_path_stdin:
+        lea r9, [rip + cat_stdin_path];
+      entry_pipe_path_ready:
+        call schema_wire_register;          // refresh cat_schema_id (cat#27)
+        lea r10, [rip + cat_schema_id];
+        mov rax, [r10];                     // rax = cat_schema_id
+        mov rdi, rbp;                       // bytes_written (accumulated)
+        mov rsi, rax;                       // schema_id
+        mov rdx, r9;                        // path_ptr
+        call pipe_emit_send;                // sys_semantic_send, best-effort
+
         // ---- Step 9: sys_exit(rbx). SC+ ID 60. Never returns. ----
         // rbx carries the exit status: 0 iff every file/stdin read
         // succeeded, 1 if any diagnostic fired (POSIX cat convention).

@@ -45,3 +45,30 @@ requires:
 # r49-r50-plan.md §5.5.
 declares_output_schemas:
   - RawByteChunk@0.1
+
+# ---------------------------------------------------------------------
+# R90-XREPO.013.M3-002 adoption note (cat#26, Wave L / v1.2.1-A)
+# ---------------------------------------------------------------------
+# design/round-retrospectives/r90-xrepo-wave3-plan.md §"R90-XREPO.013.
+# M3-002 cat -- caps.decl + adoption" ("Scope: As .013.M3-001, for cat.
+# Same shape.") calls for exactly the four `requires:` kinds already
+# declared above (KIND_USER, KIND_PDXFS_FILE, KIND_TTY, KIND_IPC_
+# ENDPOINT) -- this file predates the M3-002 ticket (landed at R50 M1)
+# but its cap set is byte-for-byte the shape M3-002 asks for, so no
+# `requires:` edit was needed to reconcile; this note is the adoption
+# record M3-002 itself is.
+#
+# The M3-002 scope's OTHER half -- "wire the libpdx-cap helper at
+# entry; refuse to run if reconciliation narrows below required set"
+# -- is NOT landed in src/entry.pdx and cannot land yet: M3-002 is
+# gated on .013.M1-002 (the libpdx-cap client helper -- "Repo-side
+# test drives the helper against a mock kernel"; not shipped in any
+# repo at this writing) and .013.M2-001 (shell's real exec-time
+# reconciliation wire-in). paideia-os/shell#39 documents shell's own
+# side of M2-001 (CHANGELOG.md "exec-time reconciliation framing in
+# sys_execve path") but shell's own src/exec.pdx still marks step (3)
+# `cap_manifest_verify` as "DEFERRED (libpdx-cap not linked)" at shell
+# HEAD -- the reconciled-set enforcement this manifest's own header
+# comment describes ("the shell's exec-time cap_manifest_verify...
+# refuses at the shell side") does not run yet anywhere in the stack.
+# See STATUS.md's Wave L section for the external-gate tracking.

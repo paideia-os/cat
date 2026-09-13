@@ -36,6 +36,7 @@ the correctness invariants, not the plumbing.
 | `m4_002_schema_passthrough.pdx`     | #12   | schema-typed passthrough (R20b frame)    | 1..6          |
 | `m4_003_large_file_streaming.pdx`   | #13   | streaming loop + bounded working set     | 1..4          |
 | `m4_004_stdin_pipe.pdx`             | #14   | stdin path + audit-NOT-fired invariant   | 1..4          |
+| `cat_errno_map.pdx` + `errno_capture.pdx` | #31 | errno-to-diagnostic mapping (7 rows, replicates `entry.pdx`'s dispatch) | 1..7 |
 | `qemu_e2e_cat_smoke.sh`             | #32   | end-to-end serial-log fingerprint (v1.1-A substrate) | 0/1/77 |
 
 Note: `qemu_e2e_cat_smoke.sh` is a bash driver script, not a `.pdx`
@@ -58,6 +59,7 @@ CatM4001 :: test_cat_m4_001_multi_file_order  : () -> u64
 CatM4002 :: test_cat_m4_002_schema_passthrough : () -> u64
 CatM4003 :: test_cat_m4_003_large_file_streaming : () -> u64
 CatM4004 :: test_cat_m4_004_stdin_pipe : () -> u64
+CatErrnoMap :: test_cat_errno_map_all : () -> u64
 ```
 
 A shell.M4 driver harness (post-shell.M4 landing) will invoke

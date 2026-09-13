@@ -11,6 +11,87 @@ M5 dual-signed released.
 
 ---
 
+## v1.2.1-A — 2026-09-13 (Wave L batch: #26 / #27 / #29 / #30 / #31)
+
+Five-issue cohort landing R90-XREPO cap-manifest reconciliation,
+SCHEMA-001 schema-registry wiring, v1.1-B semantic-pipe emission, an
+errno-mapping fixture, and this release itself.
+
+### Closed
+
+- **#26 (R90-XREPO.013.M3-002)** — `caps.decl` + adoption. Reconciled
+  the existing `requires:` block (landed pre-adoption at R50 M1)
+  against the M3-002 shape spec (`design/round-retrospectives/
+  r90-xrepo-wave3-plan.md`) and found it already byte-for-byte the
+  required four kinds (`KIND_USER` / `KIND_PDXFS_FILE` /
+  `KIND_TTY` / `KIND_IPC_ENDPOINT`) — no `requires:` edit needed.
+  - `caps.decl` — new comment block recording the adoption and
+    naming the still-external-gated half of M3-002's scope (the
+    libpdx-cap client helper wire-in + refuse-below-required-set
+    behaviour, gated on `.013.M1-002` and `.013.M2-001`).
+  - `STATUS.md` — Wave L section notes shell's own `src/exec.pdx`
+    still marks `cap_manifest_verify` "DEFERRED (libpdx-cap not
+    linked)" at HEAD, so the enforcement side of M3-002 stays
+    external-gate pending regardless of `paideia-os/shell#39`'s
+    landed (but stub-shaped) exec-time reconciliation framing.
+
+- **#27 (SCHEMA-001)** — wire `libpdx-schema-registry` client
+  (`RawByteChunk@0.1`).
+  - `src/schema_wire.pdx` — new `SchemaWire` module.
+    `libpdx_schema_registry_register(ddl_hash_ptr)` is a real,
+    linkable placeholder (paideia-as has no `STB_WEAK` linkage per
+    `libpdx-argv`'s own precedent) that unconditionally returns
+    `CAT_SCHEMA_ID_PLACEHOLDER` (`0xE05AC000`); `schema_wire_
+    register()` calls it with `RawByteChunk::_rbc_schema_hash`'s
+    address and caches the result in `cat_schema_id`. Runtime link
+    migrates to a real registry client when `libpdx-schema-registry`
+    (paideia-os#2000) lands — only this file's placeholder body
+    changes.
+
+- **#29 (v1.1-B)** — semantic-pipe emission.
+  - `src/pipe_emit.pdx` — new `PipeEmit` module. One best-effort
+    `sys_semantic_send` (sysno 115) at the end of every cat
+    invocation, carrying a 128-byte `CatPipeRecord@0.1`
+    (`version`+`op` bit-packed, `bytes_written`, `schema_id`,
+    `path_hash_lo`/`hi`, `timestamp_ticks`, 10-qword reserved —
+    see the file header for the size reconciliation against the
+    issue text's 9-qword reserved count, which sums to 120B not
+    128B).
+  - `src/entry.pdx` — new `rbp` accumulator (total bytes written
+    this run) and one call site at `entry_done`, before `sys_exit`:
+    resolves the last-processed path, refreshes `cat_schema_id` via
+    `SchemaWire::schema_wire_register`, then calls
+    `PipeEmit::pipe_emit_send`. Return value discarded (best-effort,
+    matching `cp`'s `pipe_emit_copy_record` precedent).
+
+- **#30 (v1.1-C release closer, repurposed)** — this release. `v1.1`
+  was superseded by `v1.2.0-A` before #30 landed, so this closer
+  ships as `v1.2.1-A` instead: `CHANGELOG.md` (this entry),
+  `README.md`'s repository-layout version-string line, `manifest.
+  pdxsig` (§1 version → 1.2.1, `git_tag` → `v1.2.1-A`, new
+  content_hashes entries for `src/schema_wire.pdx` and
+  `src/pipe_emit.pdx`, all `TBD-RECOMPUTED-AT-SIGN` per the standing
+  substrate-gate posture — no signing bot yet), `src/tool_ident.pdx` /
+  `src/entry.pdx`'s `entry_version_msg` bumped `1.2.0-A` → `1.2.1-A`.
+  Tag `v1.2.1-A` lands from this commit's HEAD.
+
+- **#31** — errno-mapping fixture: 7 diagnostic blobs fire from the
+  correct trigger.
+  - `tests/errno_capture.pdx` — new `ErrnoCapture` module. A
+    `sys_write(2, ...)` capture stand-in (`ec_capture_write`) plus
+    `ec_reset`, following the established M4 test-seedable-stub
+    pattern (never links into `cat.elf`; compiles standalone).
+  - `tests/cat_errno_map.pdx` — new `CatErrnoMap` module. Replicates
+    `src/entry.pdx`'s `entry_open_err` cmp-chain (errno 2/5/13/14/1/
+    default) plus a sentinel arm for the two non-errno-dispatched
+    `cat_msg_ioerror` sites (mid-copy read failure, stdin read
+    failure) — 7 rows total. `test_cat_errno_map_all` drives all
+    seven via a module-level `fake_errno` cell, asserts the captured
+    fd-2 bytes exactly match the golden `cat_msg_*` text snapshot,
+    and returns 0 on PASS or 1..7 naming the first mismatched row.
+
+---
+
 ## v1.2.0-A — 2026-09-13 (Wave-B batch: #22 / #24 / #25 / #28 / #32)
 
 Minor bump consolidating five enhancement-wave issues into a single

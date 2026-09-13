@@ -1,0 +1,170 @@
+// src/schema_wire.pdx — cat.SCHEMA-001 (cat#27, Wave L / v1.2.1-A)
+// SchemaWire module: registers RawByteChunk@0.1's canonical DDL hash
+// with libpdx-schema-registry and caches the returned schema id.
+//
+// Why this is a local stand-in, not a real libpdx-schema-registry link
+// ----------------------------------------------------------------------
+// `libpdx-schema-registry` (github.com/paideia-os/libpdx-schema-registry)
+// is confirmed INERT at this writing per paideia-os#2000 ("R90-XREPO.006
+// Stand up libpdx-schema-registry service"): the service broker only
+// knows two hardcoded test names (svc.foo/svc.foobar) and no real
+// registry client library is adopted anywhere in the tools tree (`grep
+// libpdx-schema-registry` across the org's satellite repos returns only
+// design-doc references and two prior sibling-repo fallback landings --
+// mount.pdxfs's and mkfs.pdxfs's own src/pipe_wire.pdx -- neither of
+// which links a real client either). cat's own deps.list carries a
+// single dependency (`libpdx-argv >= 1.1.3`); no schema-registry client
+// crate exists to link against.
+//
+// A true weak-symbol default (STB_WEAK, resolved to a fallback body only
+// when no stronger definition is linked) is also not an option: per
+// libpdx-argv's own version_backend.pdx header ("the paideia-as 0.36
+// encoder does not currently expose the STB_WEAK binding"), this
+// toolchain has no linker-weak mechanism to fall back on. Emitting an
+// `extern`/UND reference to a symbol no object in this build provides
+// would fail `ld -nostdlib --fatal-warnings` outright (tools/build.sh
+// links every src/*.pdx object into one flat cat.elf).
+//
+// This file therefore takes the same shape as the mount.pdxfs / mkfs.
+// pdxfs precedent: `libpdx_schema_registry_register` is defined IN this
+// module as a real, linkable function carrying the eventual real
+// contract's argument shape (a DDL-hash pointer in), but its BODY is a
+// placeholder that unconditionally returns CAT_SCHEMA_ID_PLACEHOLDER
+// (0xE05A_C000) without inspecting the pointer. This is the "WEAK stub"
+// the issue asks for, expressed the only way this toolchain supports it:
+// a real symbol, real linkage, placeholder behaviour, one documented
+// call site (`schema_wire_register`, invoked once from src/entry.pdx's
+// entry_done tail) that is the ONLY thing that needs to change when a
+// real libpdx-schema-registry client lands -- the function keeps its
+// signature, only its body swaps from "return placeholder" to "resolve
+// via the real client and return the registry's schema id".
+//
+// Record consumed
+// ----------------
+// RawByteChunk@0.1's canonical DDL hash lives at
+// `RawByteChunk::_rbc_schema_hash` (src/raw_byte_chunk.pdx, cat.ENH-008 /
+// #21) -- a 32-byte SHA-256 fingerprint of the canonical
+// "RawByteChunk@0.1\noffset:u64\nbytes:[u8]\n" DDL text. This module
+// passes its address (not its bytes) to libpdx_schema_registry_register,
+// matching the eventual real contract's expected argument shape (a
+// pointer the real client would hash-lookup / register against, not a
+// copy).
+//
+// cat_schema_id is consumed by src/pipe_emit.pdx (cat#29) as the
+// `schema_id` field of every CatPipeRecord@0.1 emission -- the two
+// issues share this one integration point deliberately: the semantic-
+// pipe record annotates itself with whatever schema-registry id this
+// run resolved (0xE05A_C000 today; a real registry-assigned id once
+// SCHEMA-001's other half lands).
+//
+// paideia-as compliance
+// ----------------------
+//   - Module name PascalCase basename (`SchemaWire`).
+//   - No `test` mnemonic; no zero-checks in this file at all.
+//   - No `and rN, imm64` on r8-r15 (no ANDs anywhere in this file).
+//   - No 2-op `imul r, imm` (no multiplies in this file).
+//   - No `neg` mnemonic.
+//   - No byte-register aliases; no byte loads/stores in this file at
+//     all (both functions move whole 8-byte pointers/ids).
+//   - No `qword ptr` / `dword ptr` Intel-style sizing -- plain
+//     `mov [mem], reg` for the one 8-byte store.
+//   - Reserved-label discipline: neither function branches, so no
+//     label prefix is required.
+//   - `r11` reserved as `lea` scratch, reloaded immediately before the
+//     one `.bss` store it guards.
+//   - `libpdx_schema_registry_register` is a two-instruction leaf
+//     (`mov rax, imm; ret`) with no stack use and no nested calls, so
+//     the caller's rsp alignment at its own call site is functionally
+//     immaterial to it; `schema_wire_register` nonetheless brackets
+//     that call with `sub rsp, 8` / `add rsp, 8` to keep the project's
+//     rsp%16==0-at-CALL convention intact transitively (entry rsp%16==8
+//     is the universal post-CALL SysV state this module's own caller,
+//     src/entry.pdx's entry_done, delivers).
+
+module SchemaWire = structure {
+
+  // ============================================================================
+  // CAT_SCHEMA_ID_PLACEHOLDER — the id `libpdx_schema_registry_register`
+  // returns unconditionally until a real libpdx-schema-registry client
+  // is adopted. Chosen to read unambiguously as a cat-owned sentinel
+  // (0xE05A_C000 -- "E05A" evokes "cat" loosely as a hex mnemonic slot
+  // reserved for this tool, "C000" marks it a Cat-family placeholder
+  // Id) rather than 0, which would be indistinguishable from
+  // cat_schema_id's own zero-initialised default and could silently
+  // read as "never registered" to a downstream consumer.
+  // ============================================================================
+  pub let CAT_SCHEMA_ID_PLACEHOLDER : u64 = 0xE05AC000
+
+  // ============================================================================
+  // cat_schema_id — cached result of the last schema_wire_register()
+  // call. Zero until the first call; consumers (src/pipe_emit.pdx)
+  // treat 0 as "not yet registered" and CAT_SCHEMA_ID_PLACEHOLDER as
+  // "registered against the placeholder registry stand-in".
+  // ============================================================================
+  pub let mut cat_schema_id : u64 = 0
+
+  // ============================================================================
+  // libpdx_schema_registry_register(ddl_hash_ptr) -> schema_id
+  //
+  // Signature: libpdx_schema_registry_register : (u64) -> u64 !{} @{}
+  //   RDI (input):  ddl_hash_ptr — pointer to a 32-byte schema DDL
+  //                 fingerprint (e.g. RawByteChunk::_rbc_schema_hash).
+  //                 Accepted per the eventual real contract's shape;
+  //                 UNUSED by this placeholder body — the real client
+  //                 will hash-lookup / register using these bytes.
+  //   RAX (output): CAT_SCHEMA_ID_PLACEHOLDER, unconditionally.
+  //
+  // See module header: this is the toolchain-shaped substitute for a
+  // true STB_WEAK default (unavailable in paideia-as 0.36). Real leaf,
+  // no stack use, no nested calls -- rsp alignment at its own call
+  // site is immaterial (see module header note).
+  // ============================================================================
+  pub let libpdx_schema_registry_register : (u64) -> u64 !{} @{} =
+    fn (ddl_hash_ptr: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "cat.SCHEMA-001 (cat#27) libpdx_schema_registry_register placeholder. Real libpdx-schema-registry client is not adopted anywhere in the tools tree (paideia-os#2000 -- the service broker is inert) and paideia-as 0.36 has no STB_WEAK linkage to fall back to (per libpdx-argv version_backend.pdx's own header note), so this function IS the fallback: a real, linkable symbol with the eventual real contract's argument shape (ddl_hash_ptr in rdi) whose body unconditionally returns CAT_SCHEMA_ID_PLACEHOLDER (0xE05AC000) without touching rdi. Two-instruction leaf: mov rax, imm32; ret. No effects, no capabilities -- pure computation. When a real client lands this function's body is the ONLY thing that changes (resolve via the real client, return its schema id); the signature and every call site stay identical.",
+      block: {
+        mov rax, 0xE05AC000;         // CAT_SCHEMA_ID_PLACEHOLDER
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // schema_wire_register() -> ()
+  //
+  // Signature: schema_wire_register : () -> () !{mem} @{}
+  //
+  // Calls libpdx_schema_registry_register with RawByteChunk@0.1's
+  // canonical DDL-hash pointer and stores the result into
+  // cat_schema_id. Called once from src/entry.pdx's entry_done tail,
+  // immediately before the pipe_emit_send call that reads
+  // cat_schema_id back out (cat#29).
+  //
+  // Register plan: no callee-save touched; rdi carries the hash
+  // pointer into the nested call, rax carries its return back out to
+  // the `.bss` store. Entry rsp%16==8 (post-CALL SysV state, the
+  // universal condition for any function invoked via `call` from a
+  // caller that was itself aligned to 0). `sub rsp, 8` / `add rsp, 8`
+  // bracket the nested call to land rsp%16==0 at that CALL site,
+  // matching the project's alignment convention (see module header —
+  // functionally immaterial for THIS particular callee, kept anyway
+  // for consistency and because a future real client body may not
+  // stay stack-free).
+  // ============================================================================
+  pub let schema_wire_register : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat.SCHEMA-001 (cat#27) schema_wire_register. Sequence: (1) sub rsp, 8 -- align for the nested call (entry rsp%16==8 post-CALL SysV state; -8 yields 0). (2) lea rdi, [rip + _rbc_schema_hash] -- address of RawByteChunk@0.1's canonical DDL-hash fingerprint (RawByteChunk module, src/raw_byte_chunk.pdx, cat.ENH-008 / #21), passed by pointer per the eventual real registry contract's shape. (3) call libpdx_schema_registry_register -- rax = schema id (CAT_SCHEMA_ID_PLACEHOLDER today). (4) lea r11, [rip + cat_schema_id]; mov [r11], rax -- persist the result. (5) add rsp, 8 -- restore (this function returns normally to src/entry.pdx's entry_done, unlike _start's @no_frame posture, so the stack must balance before ret). No test mnemonic, no and/imul/neg, no byte ops. r11 reloaded immediately before its one use per the project's r11-scratch convention.",
+      block: {
+        sub rsp, 8;
+        lea rdi, [rip + _rbc_schema_hash];
+        call libpdx_schema_registry_register;
+        lea r11, [rip + cat_schema_id];
+        mov [r11], rax;
+        add rsp, 8;
+        ret;
+      }
+    }
+}

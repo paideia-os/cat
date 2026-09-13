@@ -1,5 +1,8 @@
 # cat — status
 
+**Current release:** v1.2.1-A (Wave L batch: #26 / #27 / #29 / #30 /
+#31 — see the "Wave L" section below and `CHANGELOG.md`).
+
 **Wave:** R50 (Wave 2)
 **Current milestone:** M5 (dual-signed release + `.pdxdoc` +
 mirror push) — CLOSED. `cat` is *released* at v1.0.0 per the
@@ -78,6 +81,47 @@ researched here). Every other enhancement-wave issue (#22 / #24 /
 #25 / #28 / #32) closed in the v1.2.0-A Wave-B batch — see the
 enhancement-wave table above and CHANGELOG.md v1.2.0-A entry.
 
+## Wave L (v1.2.1-A) — #26 / #27 / #29 / #30 / #31
+
+Five-issue cohort. See `CHANGELOG.md`'s v1.2.1-A entry for the full
+per-issue write-up; this section tracks the two items with an
+external-gate posture.
+
+| ID   | Title                                              | State  |
+|------|-----------------------------------------------------|--------|
+| #26  | R90-XREPO.013.M3-002 caps.decl + adoption           | LANDED (partial — see note below) |
+| #27  | SCHEMA-001 libpdx-schema-registry client wire        | LANDED (placeholder — see `src/schema_wire.pdx`) |
+| #29  | v1.1-B semantic-pipe emission                        | LANDED |
+| #30  | v1.1-C release closer (repurposed as v1.2.1-A)       | LANDED |
+| #31  | errno-mapping fixture (7 diagnostic blobs)           | LANDED |
+
+**#26 note (external-gate pending):** `caps.decl`'s `requires:` block
+already carried the exact four kinds R90-XREPO.013.M3-002 calls for
+(`KIND_USER` / `KIND_PDXFS_FILE` / `KIND_TTY` / `KIND_IPC_ENDPOINT`)
+from its original R50 M1 landing — no manifest edit was needed to
+reconcile, only the adoption note added at `caps.decl`'s tail. The
+OTHER half of M3-002's scope — "wire the libpdx-cap helper at entry;
+refuse to run if reconciliation narrows below required set" — is NOT
+wired into `src/entry.pdx` and cannot land yet: it depends on
+`.013.M1-002` (the libpdx-cap client helper, not shipped in any repo
+at this writing) and `.013.M2-001` (shell's real exec-time
+reconciliation). `paideia-os/shell#39` documents shell's own side of
+M2-001 landing (CHANGELOG.md: "exec-time reconciliation framing in
+sys_execve path"), but shell's own `src/exec.pdx` still marks step (3)
+`cap_manifest_verify` as "DEFERRED (libpdx-cap not linked)" at HEAD —
+the actual enforcement `caps.decl`'s own header comment describes
+("the shell's exec-time cap_manifest_verify... refuses at the shell
+side") does not run anywhere in the stack yet. Tracked here as
+external-gate pending on both `.013.M1-002` and the non-stub half of
+`.013.M2-001`; re-audit when either lands.
+
+**#27 note:** `SchemaWire::libpdx_schema_registry_register` is a real,
+linkable symbol (not a true `STB_WEAK` default — paideia-as 0.36 has
+no weak-linkage mechanism, per `libpdx-argv`'s own precedent) whose
+body unconditionally returns the placeholder id `0xE05AC000`. Runtime
+link migrates to a real `libpdx-schema-registry` client once
+paideia-os#2000 (the service itself, currently inert) lands.
+
 ## Substrate posture
 
 M4 ships four .pdx test modules under `tests/` that exercise the
@@ -128,6 +172,7 @@ invariants, not the plumbing.
 | M4-002 | 1 file (17 × 0x42) + 32-byte 0xEE hash + --schema | R20b frame layout + hash & body passthrough | 1..6 |
 | M4-003 | 1 file (131072 × 0x41) — 2 × CHUNK_MAX | streaming loop iterates > once; working set bounded at 128 KiB | 1..4 |
 | M4-004 | stdin seed "PIPED\n" (6 bytes), zero positionals | stdin path taken, audit NOT fired, byte passthrough | 1..4 |
+| cat#31 | 7 fake_errno rows via `ErrnoCapture` fd-2 stand-in | errno-to-message dispatch matches `entry.pdx`'s `entry_open_err` cmp-chain + I/O-error sentinel | 1..7 |
 
 Each test's entry function `test_cat_m4_00X_...` returns 0 on
 PASS and a distinct non-zero exit code per assertion failure so

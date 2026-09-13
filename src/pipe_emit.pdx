@@ -1,0 +1,291 @@
+// src/pipe_emit.pdx — cat.v1.1-B (cat#29, Wave L / v1.2.1-A)
+// PipeEmit module: CatPipeRecord@0.1 emission via sys_semantic_send
+// (sysno 115) at the tail of every cat invocation.
+//
+// Scope
+// -----
+// cat has never emitted anything to the kernel-side semantic-pipe ring
+// (sys_semantic_send, sysno 115, R107-M0-001 / paideia-os#2350). This
+// lands one best-effort emission at the very end of src/entry.pdx's
+// `_start` — the `entry_done` label, immediately before `sys_exit` —
+// summarising the whole invocation (every file argument processed, or
+// the stdin pass) as a single CatPipeRecord@0.1. The `cp` satellite's
+// own src/pipe.pdx (cp#33, "Closes paideia-os/cp#33") is the direct
+// shape precedent this file follows: same sysno, same "marshal into a
+// static .bss buffer, rdtsc for a timestamp, syscall, return value
+// discarded" structure.
+//
+// "One cat op" == one process invocation, not one file
+// ------------------------------------------------------
+// cat's live `_start` (src/entry.pdx) loops over every positional file
+// argument (or reads stdin once) inside ONE process invocation before
+// reaching a single `entry_done` label and exiting. There is exactly
+// one natural "before exit" call site, and the register budget at that
+// point (rbx/r12/r13/r14/r15 all committed to _start's own bookkeeping,
+// no spare callee-save slot to thread a per-file record through the
+// loop without touching the already-carefully-tuned hot paths) argues
+// for treating "the cat op" as the whole run rather than instrumenting
+// each per-file iteration. `bytes_written` is therefore the SUM across
+// every file/stdin write in the run (see the `rbp` accumulator wired
+// into src/entry.pdx's write sites), and `path_hash_lo`/`path_hash_hi`
+// identify the LAST path processed (or the `<stdin>` pseudo-path when
+// argc < 2) rather than every path — a full per-file audit trail is
+// already carried by the FileReadRecord/AuditStub design (M3-003,
+// currently unreachable dead code per the v1.1-A substrate-flip note
+// in src/entry.pdx) and is not what this record is for.
+//
+// Record layout — CatPipeRecord@0.1, 128 bytes @align(8)
+// -------------------------------------------------------
+//   [ +0] version_op     u64  -- version (low u32) | op (high u32) << 32
+//                                bit-packed into ONE 8-byte slot. paideia-as
+//                                has no native 32-bit-wide store (only
+//                                whole-u64 `mov` and byte `mov_b` are used
+//                                anywhere in this tree — see e.g. cp's
+//                                CopyRecord@0.1 zero-extending its u32
+//                                src_mode into a full u64 field); bit-
+//                                packing two logical u32s into one u64
+//                                slot via shl+or is the closest reachable
+//                                match to a real little-endian C struct
+//                                `{u32 version; u32 op;}` occupying 8
+//                                bytes, without inventing an unsupported
+//                                store width. version = CAT_PIPE_VERSION
+//                                (1). op = CAT_PIPE_OP_RUN (1) — the one
+//                                opcode this v0.1 shape defines ("a cat
+//                                run completed"); reserved for a future
+//                                op taxonomy (e.g. distinguishing the
+//                                stdin path) without a schema-tag bump.
+//   [ +8] bytes_written   u64  -- sum of every successful sys_write(1,
+//                                ...) return value across the run (see
+//                                src/entry.pdx's `rbp` accumulator).
+//   [+16] schema_id       u64  -- SchemaWire::cat_schema_id (cat#27) at
+//                                emit time — the schema-registry id this
+//                                run's RawByteChunk@0.1 DDL resolved to
+//                                (CAT_SCHEMA_ID_PLACEHOLDER = 0xE05AC000
+//                                until a real libpdx-schema-registry
+//                                client lands). This is a DIFFERENT
+//                                value from CAT_PIPE_SCHEMA_TAG below —
+//                                that tag identifies THIS record's own
+//                                wire shape to the sys_semantic_send
+//                                ring's consumer; this field is a
+//                                semantic annotation about what registry
+//                                entry the run's file content corresponds
+//                                to, orthogonal to how the record itself
+//                                is framed.
+//   [+24] path_hash_lo    u64  -- djb2 hash (seed 5381) of the last
+//                                processed path's NUL-terminated bytes
+//                                (or "<stdin>" when argc < 2).
+//   [+32] path_hash_hi    u64  -- second djb2 pass over the SAME bytes
+//                                with a different seed (17) — an
+//                                independent digest, not a derivation of
+//                                path_hash_lo, so the pair is a cheap
+//                                128-bit-ish fingerprint rather than one
+//                                hash duplicated. No multiply is used in
+//                                either pass (paideia-as's 2-op `imul
+//                                r, imm` restriction is dodged entirely
+//                                by using the djb2 `(hash<<5)+hash`
+//                                shift-add identity for `hash*33`).
+//   [+40] timestamp_ticks u64  -- raw TSC snapshot via `rdtsc` at emit
+//                                time (same idiom as cp's pipe.pdx:
+//                                rax=low32, rdx=high32, `shl rdx,32; or
+//                                rax,rdx` reconstructs the 64-bit value).
+//   [+48] reserved[10]    u64×10 -- zeroed. See size-reconciliation note.
+//
+// Size-reconciliation note (128B total)
+// --------------------------------------
+// The originating issue text lists the record as
+// `{version:u32, op:u32, bytes_written:u64, schema_id:u64,
+// path_hash_lo:u64, path_hash_hi:u64, timestamp_ticks:u64,
+// reserved[9×u64]}` and separately states the record is 128 bytes.
+// Summing the literal field list gives 4+4+8+8+8+8+8 + 9*8 = 48 + 72 =
+// 120 bytes, eight short of the stated 128-byte total. Since a FIXED
+// record length is the load-bearing invariant for any consumer that
+// decodes this ring by slot width (matching the sysno-115 ring's own
+// fixed-cap-per-slot design, cp's 24-byte CopyRecord@0.1 well under the
+// 240-byte ceiling notwithstanding), this file corrects the reserved
+// array to 10×u64 (80 bytes) so the record is exactly the specified
+// 128 bytes end to end, rather than silently shipping a 120-byte record
+// under a 128-byte name. CAT_PIPE_RECORD_LEN = 128 is therefore the
+// single source of truth; RESERVED_WORDS = 10 is derived from it, not
+// copied from the issue text's arithmetic.
+//
+// Schema tag
+// ----------
+// CAT_PIPE_SCHEMA_TAG identifies this record's WIRE SHAPE to the ring's
+// consumer (distinct from the `schema_id` FIELD inside the record body
+// — see that field's own doc above). Derived exactly like cp's
+// COPY_RECORD_SCHEMA: pack the ASCII bytes of a 7-character family name
+// ("CatPipe") followed by a version byte (0x01) into one big-endian-
+// written u64 literal (which is little-endian in memory — byte 0 =
+// 0x01, bytes 1..7 = "epiPtaC", i.e. "CatPipe" reversed):
+//   0x43 'C' 61 'a' 74 't' 50 'P' 69 'i' 70 'p' 65 'e' 01  =>
+//   CAT_PIPE_SCHEMA_TAG = 0x4361745069706501
+//
+// paideia-as compliance (v0.36+)
+// -------------------------------
+//   - Module PipeEmit (PascalCase basename matches src/pipe_emit.pdx).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - No `and rN, imm64` on r8-r15 (no ANDs in this file).
+//   - No 2-op `imul r, imm` and no multiply of any shape — the djb2
+//     hash uses the `(hash<<5)+hash` shift-add identity instead.
+//   - No `neg` mnemonic (unused; no negation needed here).
+//   - Byte loads use `xor reg, reg; mov_b reg, [ptr]` (#1248 mitigation),
+//     matching src/entry.pdx's entry_strlen_nul idiom exactly.
+//   - `mov r64, imm64` (movabs auto-selected by paideia-as) for
+//     CAT_PIPE_SCHEMA_TAG and the djb2 basis constant, both > 0x7FFFFFFF
+//     is false for the djb2 seeds (5381, 17 — small) but true for the
+//     schema tag; every `cmp reg, imm` immediate stays ≤ 4096.
+//   - No `qword ptr` / `dword ptr` Intel sizing — plain `mov [mem], reg`.
+//   - Reserved-label discipline: every label prefixed `pipe_emit_`.
+//   - `pipe_emit_send` is a true leaf: only caller-save registers
+//     (rax/rcx/rdx/rdi/rsi/r8/r9/r11) are touched, no push/pop, no
+//     callee-save clobbered — matching cp's pipe_emit_copy_record
+//     exactly. No CALL instructions inside it and one `syscall` at the
+//     very end, so SysV 16-byte alignment at entry is immaterial (the
+//     SYSCALL instruction is stack-invariant, same note as cp's file).
+
+module PipeEmit = structure {
+
+  // -- Syscall id -------------------------------------------------------
+  // R107-M0-001 (paideia-os #2350). Mirrors cp/src/pipe.pdx and
+  // src/kernel/core/syscall/handlers/sys_semantic_send.pdx.
+  pub let SYSCALL_SEMANTIC_SEND : u64 = 115
+
+  // -- Record shape constants --------------------------------------------
+  pub let CAT_PIPE_RECORD_LEN : u64 = 128
+  pub let CAT_PIPE_VERSION    : u64 = 1
+  pub let CAT_PIPE_OP_RUN     : u64 = 1
+
+  // -- Schema tag ---------------------------------------------------------
+  // See module header for the derivation ("CatPipe" + 0x01 version byte,
+  // packed exactly like cp's COPY_RECORD_SCHEMA).
+  pub let CAT_PIPE_SCHEMA_TAG : u64 = 0x4361745069706501
+
+  // -- Record scratch buffer (.bss, single global) -------------------------
+  // sys_semantic_send copies the record bytes into the kernel's ring
+  // synchronously (same contract cp relies on), so this buffer is safe
+  // to reuse on the next emit without a barrier. In practice cat issues
+  // at most one emission per process lifetime (see module header).
+  pub let mut pipe_emit_record_buf : [u8; 128] = uninit @align(8)
+
+  // ============================================================================
+  // pipe_emit_send(bytes_written, schema_id, path_ptr) -> discarded rax
+  //
+  // Signature: pipe_emit_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{}
+  //   RDI (input):  bytes_written — sum of successful sys_write(1, ...)
+  //                 returns across the run (src/entry.pdx's `rbp`).
+  //   RSI (input):  schema_id — SchemaWire::cat_schema_id at emit time.
+  //   RDX (input):  path_ptr — NUL-terminated pointer to the last
+  //                 processed path (or the `<stdin>` pseudo-path).
+  //   RAX (output): the syscall's return value verbatim (caller
+  //                 discards — best-effort emission, same posture as
+  //                 cp's pipe_emit_copy_record).
+  //
+  // Marshals the 128-byte CatPipeRecord@0.1 into `pipe_emit_record_buf`,
+  // then invokes sys_semantic_send. True leaf: no callee-save touched,
+  // no push/pop, no CALL instructions (the two djb2 hash passes are
+  // inlined loops, not nested calls) — only caller-save registers used
+  // throughout, so the SysV 16-byte alignment at this function's own
+  // call site is immaterial (matches cp's pipe_emit_copy_record note).
+  //
+  // Register plan:
+  //   rdi/rsi/rdx = incoming args, consumed into the buffer / hash
+  //                 cursor before any further clobber
+  //   r8  = saved path_ptr (survives both hash passes so pass 2 can
+  //         re-walk from the start)
+  //   r9  = djb2 "hash before shift" temp, reused across both passes
+  //   rax = hash accumulator / rdtsc low half / final syscall id+return
+  //   rcx = byte-load scratch (hash loops) / rdtsc high half source
+  //   r11 = `lea` scratch for the record-buffer base, reloaded before
+  //         every store per the project's r11-scratch convention
+  // ============================================================================
+  pub let pipe_emit_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (bytes_written: u64) (schema_id: u64) (path_ptr: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "cat.v1.1-B (cat#29) pipe_emit_send. (1) Stash path_ptr (rdx) into r8 before it is consumed as the pass-1 hash cursor -- needed again for pass 2. (2) Marshal version_op = CAT_PIPE_VERSION | (CAT_PIPE_OP_RUN << 32) into +0 via mov+shl+or (no native 32-bit store exists in this toolchain; see module header). (3) Store bytes_written (rdi) @+8 and schema_id (rsi) @+16 verbatim -- both already full 64-bit values, no packing needed. (4) Pass-1 djb2 hash (seed 5381) over path_ptr's NUL-terminated bytes into rax using the `mov r9,rax; shl rax,5; add rax,r9; add rax,rcx` shift-add identity for hash*33+c (dodges the 2-op imul restriction entirely -- no multiply anywhere in this file), byte-loaded via `xor rcx,rcx; mov_b rcx,[rdx]` per #1248, terminating on a NUL byte (cmp rcx,0; je); store result @+24 (path_hash_lo). (5) Pass-2: reload the cursor from r8 (the saved original path_ptr), reseed rax=17, repeat the identical loop shape, store @+32 (path_hash_hi) -- an independent digest, not a derivation of pass 1. (6) rdtsc -> rax=low32/rdx=high32; `shl rdx,32; or rax,rdx` reconstructs the 64-bit tick counter (same idiom as cp's pipe.pdx, itself sourced from src/kernel/core/fs/pdxfs_lite/uuid.pdx); store @+40 (timestamp_ticks). (7) Zero the 10-qword reserved region @+48..+120 via ten explicit `mov [r11+N], rax` stores (rax already 0 is NOT assumed -- rax holds tsc_ticks at this point, so an explicit `xor rax,rax` precedes the zeroing block). (8) sys_semantic_send(CAT_PIPE_SCHEMA_TAG, &pipe_emit_record_buf, 128): rdi=schema tag via movabs (> 0x7FFFFFFF), rsi=lea of the buffer, rdx=128, rax=115 (SYSCALL_SEMANTIC_SEND), syscall. Return value verbatim; caller (src/entry.pdx's entry_done) discards it -- both failure classes (-EFAULT bad record_ptr, -EINVAL out-of-range len) would be marshalling bugs in this file, not per-run conditions the caller can act on, matching cp's pipe.pdx precedent verbatim. True leaf: only rax/rcx/rdx/rdi/rsi/r8/r9/r11 touched, no callee-save clobbered, no push/pop, no CALL instructions -- entry alignment is immaterial (SYSCALL is stack-invariant). Encoder discipline: no test rN,rN; no and rN,imm64 on r8-r15; no 2-op imul (no imul at all); no neg; byte loads via xor+mov_b (#1248); every cmp immediate is 0 (zero-checks only) except none exceed 0x7FFFFFFF regardless. Labels prefixed pipe_emit_ per the reserved-label discipline.",
+      block: {
+        // ---- (1) save path_ptr for the second hash pass ----------------
+        mov r8, rdx;
+
+        // ---- (2) version_op = version | (op << 32) ----------------------
+        mov rax, 1;                        // CAT_PIPE_VERSION
+        mov rcx, 1;                        // CAT_PIPE_OP_RUN
+        shl rcx, 32;
+        or rax, rcx;
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 0], rax;
+
+        // ---- (3) bytes_written @+8, schema_id @+16 -----------------------
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 8], rdi;
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 16], rsi;
+
+        // ---- (4) pass 1: djb2(seed=5381) over path_ptr -> path_hash_lo --
+        mov rdx, r8;                       // cursor = path_ptr
+        mov rax, 5381;                     // djb2 basis (lo)
+      pipe_emit_hash1_head:
+        xor rcx, rcx;
+        mov_b rcx, [rdx];
+        cmp rcx, 0;
+        je pipe_emit_hash1_done;
+        mov r9, rax;                       // r9 = hash (pre-shift)
+        shl rax, 5;                        // hash << 5
+        add rax, r9;                       // + hash => hash*33
+        add rax, rcx;                      // + byte
+        add rdx, 1;
+        jmp pipe_emit_hash1_head;
+      pipe_emit_hash1_done:
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 24], rax;               // path_hash_lo
+
+        // ---- (5) pass 2: djb2(seed=17), independent digest -> path_hash_hi
+        mov rdx, r8;                       // cursor = path_ptr (re-walk)
+        mov rax, 17;                       // djb2 basis (hi)
+      pipe_emit_hash2_head:
+        xor rcx, rcx;
+        mov_b rcx, [rdx];
+        cmp rcx, 0;
+        je pipe_emit_hash2_done;
+        mov r9, rax;
+        shl rax, 5;
+        add rax, r9;
+        add rax, rcx;
+        add rdx, 1;
+        jmp pipe_emit_hash2_head;
+      pipe_emit_hash2_done:
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 32], rax;               // path_hash_hi
+
+        // ---- (6) rdtsc -> full 64-bit tick counter -----------------------
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 40], rax;               // timestamp_ticks
+
+        // ---- (7) zero reserved[10] @+48..+120 -----------------------------
+        xor rax, rax;
+        lea r11, [rip + pipe_emit_record_buf];
+        mov [r11 + 48], rax;
+        mov [r11 + 56], rax;
+        mov [r11 + 64], rax;
+        mov [r11 + 72], rax;
+        mov [r11 + 80], rax;
+        mov [r11 + 88], rax;
+        mov [r11 + 96], rax;
+        mov [r11 + 104], rax;
+        mov [r11 + 112], rax;
+        mov [r11 + 120], rax;
+
+        // ---- (8) sys_semantic_send(CAT_PIPE_SCHEMA_TAG, buf, 128) --------
+        mov rdi, 0x4361745069706501;       // CAT_PIPE_SCHEMA_TAG (movabs)
+        lea rsi, [rip + pipe_emit_record_buf];
+        mov rdx, 128;                      // CAT_PIPE_RECORD_LEN
+        mov rax, 115;                      // SYSCALL_SEMANTIC_SEND
+        syscall;
+
+        ret
+      }
+    }
+}

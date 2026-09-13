@@ -1,0 +1,135 @@
+// tests/errno_capture.pdx — cat#31 fixture support
+// ErrnoCapture module: a `sys_write(2, ...)` stand-in for the
+// cat_errno_map.pdx fixture.
+//
+// Why a capture wrapper instead of a real syscall
+// -------------------------------------------------
+// Per `tests/README.md` and `design/architecture.md` §3.2, cat's own
+// test modules never link into `cat.elf` (`tools/build.sh` compiles
+// every `tests/*.pdx` to a `.o` but excludes them from the final
+// `ld` step) and are not executed under QEMU at this milestone — the
+// established M4 pattern is a test-seedable stand-in standing in for
+// whatever real substrate a module would otherwise call (`FileRead`'s
+// FIFO seed table for `sys_pdxfs_open`, `TtySink`'s `.bss` buffer for
+// the real tty write, etc.). This module is that same pattern applied
+// to `sys_write(2, ...)`: instead of trapping into the kernel, capture
+// the bytes into `ec_buf` so a test can assert on them directly.
+//
+// Contract
+// --------
+//   ec_reset : () -> () !{mem} @{}
+//     Zero ec_len. Call before every row in a table-driven fixture.
+//
+//   ec_capture_write : (u64, u64) -> u64 !{mem} @{}
+//     RDI: ptr — source bytes to append
+//     RSI: len — byte count
+//     RAX: len (mirrors a successful real sys_write's return)
+//     Appends `len` bytes from `ptr` to `ec_buf` at the current
+//     `ec_len` cursor and advances `ec_len` by `len`. No overflow
+//     guard against EC_BUF_CAP — every caller in this fixture writes
+//     well under 32 bytes per call and at most one row's worth
+//     (<= 31 bytes) accumulates before the next `ec_reset`.
+//
+// paideia-as compliance
+// ----------------------
+//   - Module name PascalCase basename (`ErrnoCapture`).
+//   - No `test` mnemonic; every zero-check via `cmp rN, 0`.
+//   - No `and rN, imm64` on r8-r15 (no ANDs in this file).
+//   - No 2-op `imul r, imm` (no multiplies in this file).
+//   - No `neg` mnemonic.
+//   - Byte loads/stores use `xor reg,reg; mov_b reg,[ptr]` /
+//     `mov_b [ptr], reg` with whole-register operands (no
+//     sil/dil/bl byte-register aliases), matching
+//     src/raw_byte_chunk.pdx's rbc_emit_chunk idiom exactly.
+//   - No `qword ptr` / `dword ptr` Intel sizing.
+//   - Reserved-label discipline: labels prefixed `ecw_`.
+//   - `r11` reloaded via `lea` before every `.bss` access per the
+//     project's r11-scratch convention.
+
+module ErrnoCapture = structure {
+
+  // ============================================================================
+  // ec_buf — capture buffer for the current row's diagnostic bytes.
+  // 256 bytes is generous headroom over the longest golden message in
+  // cat_errno_map.pdx (30 bytes, cat_msg_eperm's text).
+  // ============================================================================
+  pub let EC_BUF_CAP : u64 = 256
+  pub let mut ec_buf : [u8; 256] = uninit @align(8)
+
+  // ============================================================================
+  // ec_len — bytes captured since the last ec_reset.
+  // ============================================================================
+  pub let mut ec_len : u64 = uninit @align(8)
+
+  // ============================================================================
+  // ec_reset() -> ()
+  //
+  // Signature: ec_reset : () -> () !{mem} @{}
+  //
+  // Zero ec_len. Leaf; r11 scratch.
+  // ============================================================================
+  pub let ec_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat#31 ec_reset. Zeroes ec_len so the next ec_capture_write call sequence starts writing at ec_buf[0]. Leaf; r11 scratch, reloaded immediately before its one use. No test mnemonic (the one zero-check this file would need -- there is none here, just an unconditional store).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + ec_len];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // ec_capture_write(ptr, len) -> len
+  //
+  // Signature: ec_capture_write : (u64, u64) -> u64 !{mem} @{}
+  //   RDI: ptr — source bytes
+  //   RSI: len — byte count
+  //   RAX: len, unconditionally (mirrors a successful real sys_write)
+  //
+  // Byte-copies ptr[0..len) to ec_buf[ec_len..ec_len+len), then
+  // advances ec_len by len. Register plan (leaf, no push/pop):
+  //   r8  = src cursor (walks ptr..ptr+len)
+  //   rcx = dst cursor (starts at ec_len, walks to ec_len+len)
+  //   r9  = bytes copied so far (loop counter, compared against rsi)
+  //   r11 = lea scratch for ec_buf's rip-relative base, reloaded each
+  //         iteration per the project's r11-scratch convention
+  // ============================================================================
+  pub let ec_capture_write : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) (len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat#31 ec_capture_write. Stands in for sys_write(2, ptr, len) in the cat_errno_map.pdx fixture: byte-copies ptr[0..len) into ec_buf starting at the current ec_len cursor, using the exact `mov r8,rdi` (src cursor) / `lea r11,[rip+ec_buf]; add r11,rcx; mov_b [r11],rax` (base-plus-running-offset store, no SIB register-index needed) idiom src/raw_byte_chunk.pdx's rbc_emit_chunk already establishes for this codebase. Loop terminates when r9 (bytes copied) reaches rsi (len, untouched throughout since nothing else writes it). Persists the advanced cursor back to ec_len, then returns rsi (len) in rax, mirroring a successful real sys_write's return value so a caller written against the real syscall's contract needs no special-casing. Leaf: no push/pop, no callee-save touched (rax/rcx/rdi/rsi/r8/r9/r11 only). No test mnemonic; the only comparison is the loop guard `cmp r9, rsi` (register-register, not an immediate). No and/imul/neg. Byte load via xor+mov_b (#1248); byte store via mov_b with a full-width destination register (r11), no byte-register alias. Labels prefixed ecw_.",
+      block: {
+        mov r8, rdi;                      // r8 = src cursor
+        lea r11, [rip + ec_len];
+        mov rcx, [r11];                   // rcx = dst cursor (current ec_len)
+        xor r9, r9;                       // r9 = bytes copied
+
+      ecw_head:
+        cmp r9, rsi;
+        jge ecw_done;
+
+        xor rax, rax;
+        mov_b rax, [r8];                  // src byte
+
+        lea r11, [rip + ec_buf];
+        add r11, rcx;                     // dst = &ec_buf[cursor]
+        mov_b [r11], rax;
+
+        add r8, 1;
+        add rcx, 1;
+        add r9, 1;
+        jmp ecw_head;
+
+      ecw_done:
+        lea r11, [rip + ec_len];
+        mov [r11], rcx;                   // persist advanced cursor
+
+        mov rax, rsi;                     // return len
+        ret;
+      }
+    }
+}

@@ -1,0 +1,360 @@
+// tests/cat_errno_map.pdx — cat#31 errno-mapping fixture
+// CatErrnoMap module: asserts that all 7 diagnostic blobs
+// src/entry.pdx's errno / read-failure dispatch can emit fire from
+// the correct trigger and carry the correct text.
+//
+// What this replicates from src/entry.pdx
+// ------------------------------------------
+// `entry_open_err` (the open-failure branch of `_start`) dispatches on
+// a positive errno value through a `cmp`-chain (2=ENOENT, 5=EIO,
+// 13=EACCES, 14=EFAULT, 1=EPERM, default=unknown) and selects one of
+// six `cat_msg_*` `.rodata` blobs (ENH-003 / #23). A seventh blob,
+// `cat_msg_ioerror`, is used by TWO other branches (`entry_read_err`
+// mid-copy and `entry_stdin_err`) that do NOT dispatch on errno at all
+// — they always emit the same fixed "I/O error" text regardless of
+// the real errno `sys_read` returned. Seven distinct blobs total.
+//
+// `_start` is not itself callable from a test (`@no_frame`, ends in
+// `sys_exit`, and the branch selection lives inline rather than
+// behind an exported symbol), so this fixture is a self-contained
+// replica of the dispatch shape, driven by a module-level
+// `fake_errno` cell rather than a real `sys_open`/`sys_read` failure —
+// same posture as the pre-v1.1-A M4 fixtures driving the (now dead)
+// stub dispatch tree via seed tables. `cem_diag_emit` reproduces
+// `entry_open_err`'s cmp-chain byte-for-byte (same errno constants,
+// same branch order) plus one extra arm (errno slot 0) standing in
+// for the two non-errno-dispatched `cat_msg_ioerror` call sites. The
+// golden message text in this file (`cem_msg_*`) is a snapshot of
+// `src/entry.pdx`'s `cat_msg_*` blobs at the time of writing — a
+// drift guard comparing the two byte-for-byte at build time is a
+// follow-up, not implemented here.
+//
+// Row table (7 rows, per cat#31)
+// --------------------------------
+// A literal `[(errno_slot, expected_prefix)]` array is not idiomatic
+// here: paideia-as has no data literals for mixed-shape structures
+// (`tests/README.md` §1), and every existing M4 fixture in this repo
+// (`m4_001_multi_file_order.pdx` etc.) drives its assertions as
+// explicit per-case sequences rather than a walked table for the same
+// reason. `test_cat_errno_map_all` below is that table, expressed as
+// seven explicit (set fake_errno -> emit -> compare) blocks.
+//
+//   Row | errno_slot | Golden blob
+//   ----|------------|---------------------------------------------
+//    1  | 2 (ENOENT) | cem_msg_enoent  (": No such file or directory\n")
+//    2  | 5 (EIO)    | cem_msg_eio     (": Input/output error\n")
+//    3  | 13 (EACCES)| cem_msg_eacces  (": Permission denied\n")
+//    4  | 14 (EFAULT)| cem_msg_efault  (": Bad address\n")
+//    5  | 1 (EPERM)  | cem_msg_eperm   (": denied by capability policy\n")
+//    6  | 99 (other) | cem_msg_unknown (": unknown error\n")
+//    7  | 0 (sentinel, mid-copy/stdin path) | cem_msg_ioerror (": I/O error\n")
+//
+// Assertion shape
+// -----------------
+// Each row: `ec_reset` -> set `fake_errno` -> `cem_diag_emit` ->
+// `cem_check_row(golden_ptr, golden_len)`. `cem_check_row` asserts
+// BOTH that `ec_len == golden_len` (exact match, not merely a prefix —
+// every row's golden blob IS the emitted blob byte-for-byte in this
+// fixture) and that every byte matches. `test_cat_errno_map_all`
+// returns 0 on PASS or 1..7 naming the first row (1-based) that
+// mismatched.
+//
+// paideia-as compliance
+// ------------------------
+//   - Module name PascalCase basename (`CatErrnoMap`).
+//   - No `test` mnemonic; every zero-check via `cmp rN, 0`.
+//   - No `and rN, imm64` on r8-r15.
+//   - No 2-op `imul r, imm` (no multiplies anywhere in this file).
+//   - No `neg` mnemonic.
+//   - Byte loads via `xor reg,reg; mov_b reg,[ptr]` (#1248), matching
+//     src/entry.pdx's own idiom.
+//   - No `qword ptr` / `dword ptr` Intel sizing.
+//   - Reserved-label discipline: labels prefixed `cem_`.
+//   - `test_cat_errno_map_all` brackets its body in `sub rsp, 8` /
+//     `add rsp, 8` (no pushes anywhere in the function, so a single
+//     one-time adjustment holds rsp%16==0 at every one of its ~20
+//     nested CALL sites) since entry rsp%16==8 is the universal
+//     post-CALL SysV state and this function returns normally to its
+//     own future driver (not `@no_frame`). `cem_diag_emit` does the
+//     same (single shared `ret` at `cem_case_done`). `cem_check_row`
+//     and the two `ec_*` helpers in errno_capture.pdx make no nested
+//     calls, so they need no alignment adjustment at all.
+
+module CatErrnoMap = structure {
+
+  // ============================================================================
+  // fake_errno — the value cem_diag_emit dispatches on. Set by each
+  // row in test_cat_errno_map_all before calling cem_diag_emit.
+  // ============================================================================
+  pub let mut fake_errno : u64 = uninit @align(8)
+
+  // ============================================================================
+  // Golden message blobs — snapshot of src/entry.pdx's cat_msg_* text
+  // (ENH-003 / #23). Byte-exact, single line per the fingerprint-
+  // extractor requirement.
+  // ============================================================================
+  pub let cem_msg_enoent  : [u8; 29] = ": No such file or directory\n\0"
+  pub let cem_msg_eio     : [u8; 22] = ": Input/output error\n\0"
+  pub let cem_msg_eacces  : [u8; 21] = ": Permission denied\n\0"
+  pub let cem_msg_efault  : [u8; 15] = ": Bad address\n\0"
+  pub let cem_msg_eperm   : [u8; 31] = ": denied by capability policy\n\0"
+  pub let cem_msg_unknown : [u8; 17] = ": unknown error\n\0"
+  pub let cem_msg_ioerror : [u8; 13] = ": I/O error\n\0"
+
+  // ============================================================================
+  // cem_diag_emit() -> ()
+  //
+  // Signature: cem_diag_emit : () -> () !{mem} @{}
+  //
+  // Reads fake_errno and calls ec_capture_write with the matching
+  // cem_msg_* blob's (ptr, len), replicating src/entry.pdx's
+  // entry_open_err cmp-chain (2/5/13/14/1/default) plus a sentinel
+  // arm (errno slot 0) standing in for the mid-copy / stdin I/O-error
+  // branches, which entry.pdx does not errno-dispatch at all.
+  //
+  // Register plan: entry rsp%16==8 (post-CALL SysV state from
+  // test_cat_errno_map_all's own alignment bracket); `sub rsp, 8` /
+  // `add rsp, 8` land rsp%16==0 at the one `call ec_capture_write`
+  // site every branch shares (only one branch executes per call, and
+  // every branch converges on the single `cem_case_done: ret`, so one
+  // bracket covers all six branches).
+  // ============================================================================
+  pub let cem_diag_emit : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat#31 cem_diag_emit. sub rsp,8 aligns for the shared call ec_capture_write site (entry rsp%16==8; -8 yields 0). Loads fake_errno into rax, then replicates entry_open_err's cmp-chain verbatim: cmp rax,2/je enoent; cmp rax,5/je eio; cmp rax,13/je eacces; cmp rax,14/je efault; cmp rax,1/je eperm; cmp rax,0/je ioerror (new arm, standing in for the two non-errno-dispatched cat_msg_ioerror call sites in entry.pdx); default falls to unknown. Each branch loads rdi=lea(blob), rsi=blob's literal length, then `call ec_capture_write`, then jmp cem_case_done (unknown falls through naturally, needing no jmp). add rsp,8 before the single ret restores the caller's stack. No test mnemonic (every check is cmp rax,imm against the errno cmp-chain's own small positive constants, all <= 99). No and/imul/neg. Labels prefixed cem_case_.",
+      block: {
+        sub rsp, 8;
+
+        lea r11, [rip + fake_errno];
+        mov rax, [r11];
+
+        cmp rax, 2;
+        je cem_case_enoent;
+        cmp rax, 5;
+        je cem_case_eio;
+        cmp rax, 13;
+        je cem_case_eacces;
+        cmp rax, 14;
+        je cem_case_efault;
+        cmp rax, 1;
+        je cem_case_eperm;
+        cmp rax, 0;
+        je cem_case_ioerror;
+        jmp cem_case_unknown;
+
+      cem_case_enoent:
+        lea rdi, [rip + cem_msg_enoent];
+        mov rsi, 28;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_eio:
+        lea rdi, [rip + cem_msg_eio];
+        mov rsi, 21;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_eacces:
+        lea rdi, [rip + cem_msg_eacces];
+        mov rsi, 20;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_efault:
+        lea rdi, [rip + cem_msg_efault];
+        mov rsi, 14;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_eperm:
+        lea rdi, [rip + cem_msg_eperm];
+        mov rsi, 30;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_ioerror:
+        lea rdi, [rip + cem_msg_ioerror];
+        mov rsi, 12;
+        call ec_capture_write;
+        jmp cem_case_done;
+
+      cem_case_unknown:
+        lea rdi, [rip + cem_msg_unknown];
+        mov rsi, 16;
+        call ec_capture_write;
+
+      cem_case_done:
+        add rsp, 8;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // cem_check_row(want_ptr, want_len) -> u64 (0 == match, 1 == mismatch)
+  //
+  // Signature: cem_check_row : (u64, u64) -> u64 !{mem} @{}
+  //
+  // Compares ErrnoCapture::ec_buf[0 .. want_len) against
+  // want_ptr[0 .. want_len) byte-for-byte and confirms
+  // ErrnoCapture::ec_len == want_len (exact match). No nested calls,
+  // so no alignment adjustment is needed regardless of caller state.
+  // ============================================================================
+  pub let cem_check_row : (u64, u64) -> u64 !{mem} @{} =
+    fn (want_ptr: u64) (want_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat#31 cem_check_row. Loads ec_len and compares it against want_len (rsi) first -- a length mismatch is an immediate reject, no byte walk needed. On length match, walks want_ptr (r8 cursor) and ec_buf (r9 cursor) in lockstep for want_len bytes via xor+mov_b loads (#1248), comparing each pair; any mismatch rejects immediately. r10 is the loop counter compared against rsi (register-register, not an immediate). No nested calls -- pure comparison, so the caller's rsp alignment is immaterial to this function. Leaf; no push/pop. Labels prefixed cem_row_.",
+      block: {
+        lea r11, [rip + ec_len];
+        mov rax, [r11];
+        cmp rax, rsi;
+        jne cem_row_mismatch;
+
+        mov r8, rdi;                      // r8 = want cursor
+        lea r9, [rip + ec_buf];           // r9 = captured cursor
+        xor r10, r10;                     // r10 = i
+
+      cem_row_head:
+        cmp r10, rsi;
+        jge cem_row_match;
+
+        xor rax, rax;
+        mov_b rax, [r8];
+        xor rcx, rcx;
+        mov_b rcx, [r9];
+        cmp rax, rcx;
+        jne cem_row_mismatch;
+
+        add r8, 1;
+        add r9, 1;
+        add r10, 1;
+        jmp cem_row_head;
+
+      cem_row_match:
+        xor rax, rax;
+        ret;
+
+      cem_row_mismatch:
+        mov rax, 1;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // test_cat_errno_map_all() -> u64
+  //
+  // Signature: test_cat_errno_map_all : () -> u64 !{mem} @{}
+  //
+  // Drives all 7 rows (see module header table). Returns 0 on PASS or
+  // a distinct 1..7 code naming the first row (1-based) that
+  // mismatched, matching every other tests/*.pdx fixture's
+  // "distinct non-zero exit code per assertion failure" convention.
+  // ============================================================================
+  pub let test_cat_errno_map_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "cat#31 test_cat_errno_map_all. sub rsp,8 aligns once for every nested call in this function (no pushes occur anywhere in the body, so rsp holds one constant value -- and therefore one constant alignment -- across all ~20 CALL sites: ec_reset x7, cem_diag_emit x7 (each of which itself nests one call ec_capture_write, independently aligned per its own bracket), cem_check_row x7). Each of the 7 rows: call ec_reset (clears the capture buffer); lea r11,[fake_errno]; mov rax,<slot>; mov[r11],rax (sets the driving errno); call cem_diag_emit (replicates entry.pdx's dispatch, writes through ec_capture_write); lea rdi,[golden blob]; mov rsi,<golden len>; call cem_check_row (asserts exact match); cmp rax,0; jne <row's fail label>. All 7 rows use fresh register loads at every step -- no cross-row register-liveness assumptions, so clobbers from ec_reset/cem_diag_emit/cem_check_row's own internals (rax/rcx/rdx/r8/r9/r10/r11) never leak between rows. add rsp,8 before every one of the 8 ret points (pass path + 7 fail labels) restores the caller's stack -- unlike entry.pdx's _start, this function is not @no_frame and returns normally to a future driver harness. No test mnemonic; every check is cmp reg,0 or cmp reg,imm with imm <= 99. Labels prefixed cem_fail_.",
+      block: {
+        sub rsp, 8;
+
+        // Row 1: ENOENT
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 2; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_enoent]; mov rsi, 28;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_1;
+
+        // Row 2: EIO
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 5; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_eio]; mov rsi, 21;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_2;
+
+        // Row 3: EACCES
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 13; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_eacces]; mov rsi, 20;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_3;
+
+        // Row 4: EFAULT
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 14; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_efault]; mov rsi, 14;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_4;
+
+        // Row 5: EPERM
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 1; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_eperm]; mov rsi, 30;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_5;
+
+        // Row 6: unknown / default (sentinel 99)
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 99; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_unknown]; mov rsi, 16;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_6;
+
+        // Row 7: mid-copy / stdin I/O error (sentinel 0; entry.pdx does
+        // not errno-dispatch this branch -- always cat_msg_ioerror)
+        call ec_reset;
+        lea r11, [rip + fake_errno]; mov rax, 0; mov [r11], rax;
+        call cem_diag_emit;
+        lea rdi, [rip + cem_msg_ioerror]; mov rsi, 12;
+        call cem_check_row;
+        cmp rax, 0; jne cem_fail_7;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      cem_fail_1:
+        mov rax, 1;
+        add rsp, 8;
+        ret;
+
+      cem_fail_2:
+        mov rax, 2;
+        add rsp, 8;
+        ret;
+
+      cem_fail_3:
+        mov rax, 3;
+        add rsp, 8;
+        ret;
+
+      cem_fail_4:
+        mov rax, 4;
+        add rsp, 8;
+        ret;
+
+      cem_fail_5:
+        mov rax, 5;
+        add rsp, 8;
+        ret;
+
+      cem_fail_6:
+        mov rax, 6;
+        add rsp, 8;
+        ret;
+
+      cem_fail_7:
+        mov rax, 7;
+        add rsp, 8;
+        ret;
+      }
+    }
+}

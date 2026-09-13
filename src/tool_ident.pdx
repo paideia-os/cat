@@ -78,6 +78,6 @@ module ToolIdent = structure {
   // inline `--version` fast path's output and libpdx-argv's
   // auto-emit output is exactly the ENH-032 regression class.
   // ============================================================================
-  pub let PDX_TOOL_VERSION : [u8; 8] = "1.2.0-A\0"
+  pub let PDX_TOOL_VERSION : [u8; 8] = "1.2.1-A\0"
 
 }

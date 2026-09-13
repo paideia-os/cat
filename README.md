@@ -314,10 +314,13 @@ src/pipe_out.pdx           # PipeOut: semantic-pipe frame emitter
 src/file_schema.pdx        # FileSchema: per-handle schema-hash lookup
 src/raw_byte_chunk.pdx     # RawByteChunk: schemaless record emission
 src/audit_stub.pdx         # AuditStub: per-file FileReadRecord gate
-tests/                     # four correctness modules (see tests/README.md)
+src/tool_ident.pdx         # ToolIdent: PDX_TOOL_NAME/VERSION externs
+src/schema_wire.pdx        # SchemaWire: libpdx-schema-registry wire (#27)
+src/pipe_emit.pdx          # PipeEmit: sys_semantic_send emission (#29)
+tests/                     # correctness modules (see tests/README.md)
 tools/build.sh             # assembles every src/ and tests/ .pdx
 STATUS.md                  # milestone + issue rollup
-CHANGELOG.md               # release history (v1.0.0)
+CHANGELOG.md               # release history (v1.2.1-A)
 MIRROR.md                  # package staging-push manifest
 ```
 
