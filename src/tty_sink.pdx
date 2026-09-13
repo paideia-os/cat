@@ -1,8 +1,33 @@
 // src/tty_sink.pdx — cat.M1-003 (skeleton) → cat.M2-001..M2-004
+//                    → v1.1-A retirement → v1.2.0-A (Closes #24)
 // TtySink module: bounded write sink standing in for KIND_TTY(write).
 //
-// Design context
-// --------------
+// v1.2.0-A retirement note (Closes cat #24 — 64 KiB output ceiling)
+// -----------------------------------------------------------------
+// The 64 KiB output ceiling that cat #24 flagged is REMOVED in the
+// live path by the v1.1-A substrate flip (see src/entry.pdx header
+// note "Retired stub modules (unreachable dead code post-v1.1-A)").
+// _start no longer routes through cat_dispatch, so no runtime path
+// reaches tty_write_bytes / tty_write_byte / tty_reset / tty_out_buf
+// / tty_out_len — the live byte pump in _start reads sys_read(fd,
+// cat_buf, 4096) in a loop until rax == 0 (EOF) and hands each
+// n-byte chunk directly to sys_write(1, cat_buf, n) with no
+// intermediate buffer and no cap. A 1 GiB file cats through cat_buf
+// in 262144 sys_read/sys_write pairs — no OOM, no ceiling, no
+// buffered-write overflow to distinguish from EOF.
+//
+// The stub's own 64 KiB TTY_OUT_CAP + tty_out_buf sizing below is
+// UNCHANGED because six tests/*.pdx fixtures still assert against
+// the TTY_SINK_OVERFLOW return code at the pre-substrate-flip cap
+// (M2 correctness matrix — the fixtures compile but are never
+// linked into cat.elf, so the constants have no effect on the
+// shipped binary). Removing this file wholesale is a downstream
+// cleanup requiring coordinated updates to caps.decl / STATUS.md /
+// manifest.pdxsig / cat.pdxdoc / tests/README.md — tracked as a
+// v1.1-B follow-up alongside the sibling dead-module removals.
+//
+// Design context (v1.0 posture, retained for historical reference)
+// ----------------------------------------------------------------
 // M1's sink was a 4 KiB `.bss` scratch buffer with a cursor. M2
 // widens the cap to 64 KiB (65536) so the M2 render + streaming
 // paths — which drive the sink chunk-by-chunk from the 64 KiB

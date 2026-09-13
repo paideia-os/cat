@@ -11,6 +11,141 @@ M5 dual-signed released.
 
 ---
 
+## v1.2.0-A — 2026-09-13 (Wave-B batch: #22 / #24 / #25 / #28 / #32)
+
+Minor bump consolidating five enhancement-wave issues into a single
+release. No live-path behaviour change beyond the version-string
+byte swap (`1.1.1-A` → `1.2.0-A`); the batch is dominated by
+documentation, a new externs module for the libpdx-argv v1.1.3
+contract, deps.list's first non-empty entry, and a QEMU smoke
+placeholder. The v1.1-A substrate flip (real `sys_open`/`_read`/
+`_write`/`_close` in `entry.pdx`) that closes #24 and #28 was
+already landed at v1.1.0-A; this release re-affirms and
+explicitly-closes those issues alongside the three
+never-previously-landed items.
+
+### Closed
+
+- **#22 (ENH-002)** — Reconcile with monorepo `src/user/cat.pdx`:
+  one canonical cat. Resolution: **satellite is master** per
+  `design/user/in-tree-vs-satellite-transition.md` (Wave 18) §3.
+  The in-tree body is Phase-A `bin_seeds` substrate scheduled for
+  Phase-C retirement once the satellite build product is wired
+  into `tools/bin_seeds.manifest`. No code change in this
+  satellite; STATUS.md's enhancement-wave table records the
+  design-doc pointer.
+
+- **#24 (ENH-004)** — Remove TtySink 64 KiB output ceiling. The
+  ceiling was a live-path failure mode in the v1.0 dispatch tree
+  where every write funneled through `TtySink::tty_write_bytes`
+  and refused past `TTY_OUT_CAP = 65536`. The v1.1-A substrate
+  flip retired that path: `entry.pdx` `_start` byte-pumps
+  `sys_read(fd, cat_buf, 4096)` → `sys_write(1, cat_buf, n)`
+  in a loop until `rax == 0` (EOF) with no intermediate buffer
+  and no cap. A 1 GiB file cats through `cat_buf` (4 KiB) in
+  262144 syscall pairs — no OOM, no ceiling.
+  - `src/tty_sink.pdx` — file-header note added: module is dead
+    code post-v1.1-A; cited from the entry.pdx retired-modules
+    list. The `TTY_OUT_CAP = 65536` constant + `tty_out_buf`
+    sizing are UNCHANGED because `tests/*.pdx` fixtures still
+    reference them (fixtures compile but never link into
+    cat.elf so the constants have no shipped-binary effect).
+
+- **#25 (ENH-007)** — Migrate `cat_parse_argv` to libpdx-argv.
+  - `src/tool_ident.pdx` — new module. Defines the two
+    `.rodata` externs required by libpdx-argv v1.1.3
+    `VersionBackend::emit_default` per the ENH-032 hotfix
+    contract (paideia-os/libpdx-argv #42):
+      - `PDX_TOOL_NAME    : [u8; 4] = "cat\0"`
+      - `PDX_TOOL_VERSION : [u8; 8] = "1.2.0-A\0"`
+  - `deps.list` — first non-empty entry: `libpdx-argv >= 1.1.3`.
+    Declares the dep now (before the runtime wire-in) so
+    `pkg install cat` pre-stages libpdx-argv into the shared-lib
+    closure and the v1.1-C `Parser::parse_argv` symbol swap is
+    a rebuild-only landing.
+  - `src/argv_dispatch.pdx` — file-header note added: the
+    hand-rolled `cat_parse_argv` byte scanner is retired dead
+    code post-v1.1-A (`_start` handles argv directly with a
+    10-byte inline `--version` compare); the runtime Parser
+    wire-in is deferred to v1.1-C at which point this whole
+    module is removable alongside the sibling stub cleanups.
+  - `manifest.pdxsig` — §1 version bumped to 1.2.0; §3 deps.list
+    sha2-256 witness set to `TBD-RECOMPUTED-AT-SIGN`; §4
+    content_hashes gain three entries (`src/entry.pdx`,
+    `src/cat.ld`, `src/tool_ident.pdx`) all marked
+    `TBD-RECOMPUTED-AT-SIGN` per the same substrate-gate posture
+    as v1.0.
+
+- **#28** — v1.1-A real-body extraction. **Already landed at
+  v1.1.0-A** (commit `6a4cbf7`); this release explicitly
+  re-affirms the close in STATUS.md's enhancement-wave table.
+  `entry.pdx` `_start` inlines the four SC+ syscalls it needs
+  (read=0, write=1, open=2, close=3, exit=60) directly rather
+  than calling `cat_dispatch`; the nine-module dispatch tree
+  (`argv_dispatch.pdx` / `file_read.pdx` / `tty_sink.pdx` /
+  `stdin_source.pdx` / `render.pdx` / `audit_stub.pdx` /
+  `file_schema.pdx` / `pipe_out.pdx` / `raw_byte_chunk.pdx`) is
+  unreachable dead code. See the entry.pdx header note
+  "Retired stub modules (unreachable dead code post-v1.1-A)".
+
+- **#32** — QEMU end-to-end smoke — `cat FOO` prints `FOO` on
+  stdout. Placeholder driver script lands.
+  - `tests/qemu_e2e_cat_smoke.sh` — new. Locates the paideia-os
+    monorepo root, verifies the bin_seeds satellite cutover
+    manifest is present + routes `/bin/cat` to satellite,
+    builds `cat.elf` locally, invokes `run-qemu.sh` with a
+    boot-cmd seeding `/tmp/FOO` with `FOO\n` and executing
+    `cat /tmp/FOO`, greps the captured serial log for `^FOO$`.
+    Exit codes: 0 PASS, 1 FAIL, 77 SKIP (autotools convention).
+    All three preconditions are currently unmet at HEAD
+    (bin_seeds Phase-B not landed, tools/bin_seeds.manifest
+    does not exist) so a run yields SKIP: with a diagnostic
+    pointing at `design/user/in-tree-vs-satellite-transition.md`
+    §4 Phase-B. Actual live PASS is a downstream event.
+  - `tests/README.md` — matrix row added noting the smoke's
+    non-M4 posture (whole boot→shell→exec chain, not a module
+    contract in isolation).
+
+### Version string bump
+
+- `src/entry.pdx::entry_version_msg` — 25-wire-byte literal
+  updated `cat (paideia-os) 1.1.1-A\n` → `cat (paideia-os)
+  1.2.0-A\n`. Same length, same layout, no encoder risk.
+
+### Not touched
+
+- No functional change to `entry.pdx` `_start` body, register plan,
+  errno dispatch, or diagnostic composer. `entry_strlen_nul` /
+  `entry_emit_diag` / `_start`'s SysV frame all unchanged.
+- No change to `caps.decl` (still one `KIND_PDXFS_FILE` per file
+  arg per invariant I6).
+- No change to `cat.pdxdoc` (the flag-layer resurrection scheduled
+  for v1.1-B / v1.1-C is where the pdxdoc updates re-fire).
+- Signatures in `manifest.pdxsig` §6 + §7 remain `PENDING` bytes
+  — the T-INFRA-002 signing bot + paideia-as v0.33-crypto tag are
+  still not reachable from HEAD; every hash rehash + signature
+  emit is a downstream event.
+
+### Substrate posture at v1.2.0-A
+
+Unchanged from v1.1.0-A: the retired stub tree in
+`src/{argv_dispatch,file_read,tty_sink,stdin_source,render,
+audit_stub,file_schema,pipe_out,raw_byte_chunk}.pdx` compiles + links
+into `cat.elf` but is never reached at run time. Live path is
+_start's inline byte pump; the v1.1-B / v1.1-C follow-ups (flag
+layer resurrection over the real substrate + libpdx-argv Parser
+wire-in) are where the removal batch fires.
+
+### Fingerprint
+
+- `cat --version` → `cat (paideia-os) 1.2.0-A\n` on fd 1, exits 0.
+- `cat /nonexistent` → `cat: /nonexistent: No such file or
+  directory\n` on fd 2, exits 1 (v1.1.1-A ENH-003 preserved).
+- `bash tests/qemu_e2e_cat_smoke.sh` → exit 77 (SKIP) at HEAD;
+  exit 0 (PASS) once Phase-B bin_seeds cutover lands.
+
+---
+
 ## v1.1.1-A — 2026-09-12 (ENH-003 stderr diagnostics)
 
 Patch release closing enhancement-v1.x issue #23 (`cat.ENH-003`).

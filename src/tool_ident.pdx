@@ -1,0 +1,83 @@
+// src/tool_ident.pdx — cat.v1.2.0-A (Closes #25)
+// ToolIdent module: per-tool identity externs consumed by
+// libpdx-argv v1.1.3 VersionBackend::emit_default (ENH-032).
+//
+// Why this file exists — Wave 6 libpdx-argv contract
+// --------------------------------------------------
+// libpdx-argv 1.1.3 removed the hard-coded `DOC_TOOL_NAME` /
+// `DOC_TOOL_VERSION` literals from VersionBackend::emit_default
+// (paideia-os/libpdx-argv #42) and replaced them with two `UND`
+// externs — PDX_TOOL_NAME (lowercase, NUL-terminated) and
+// PDX_TOOL_VERSION (semver, NUL-terminated). Every consumer of
+// libpdx-argv >= 1.1.3 must provide both symbols at final-link
+// time or `ld` fails with an undefined-symbol error naming the
+// missing symbol (deliberate: no STB_WEAK fallback because the
+// pre-hotfix "doc" default would silently pass under `--version`
+// — worse than a link-time failure).
+//
+// See tools/user/libpdx-argv/src/version_backend.pdx §60-90 for
+// the full contract and the ENH-032 hotfix rationale.
+//
+// Wire-in posture at v1.2.0-A
+// ---------------------------
+// cat's satellite deps.list now declares `libpdx-argv >= 1.1.3`
+// (Closes #25). The runtime `--version` fast path in
+// src/entry.pdx still handles argv[1] == "--version" inline via
+// a 10-byte compare + one sys_write of entry_version_msg — the
+// tool_ident.pdx externs are provisional at v1.2.0-A so the
+// symbol contract is satisfied preemptively; the v1.1-C follow-up
+// swaps entry.pdx's inline path for a Parser::parse_argv call
+// which will invoke VersionBackend::emit_default (auto-emit) and
+// exit via ERR_VERSION_EMITTED (13). At that point the inline
+// version compare block in entry.pdx is retired; PDX_TOOL_NAME +
+// PDX_TOOL_VERSION become the sole source of truth for the
+// emitted `cat <ver>\nCAT VERSION OK\n` fingerprint.
+//
+// Contract shape mirrors the ENH-032 example verbatim (single-line
+// string literal per the tools/verify-fingerprint-coverage.sh
+// extractor requirement; no [u8; N] size mismatch — the array
+// length equals the literal byte count including the trailing NUL).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module name PascalCase basename (`ToolIdent`).
+//   - No function bodies -> no register plan, no push/pop parity,
+//     no encoder guardrails to enforce here.
+//   - String literals on single lines (fingerprint-extractor
+//     requirement + libpdx-argv linker resolves the symbol as-is).
+//   - Array size == literal byte count including NUL: "cat\0" = 4
+//     bytes, "1.2.0-A\0" = 8 bytes.
+//   - Both symbols `pub let` (public + immutable = .rodata) so the
+//     linker can resolve libpdx-argv's UND refs against them.
+
+module ToolIdent = structure {
+
+  // ============================================================================
+  // PDX_TOOL_NAME — lowercase tool name, NUL-terminated. Read by
+  // libpdx-argv VersionBackend::emit_default at run time via the
+  // `lea rdi, [rip + PDX_TOOL_NAME]` idiom (segment 1a of the
+  // ENH-032 emit_default body); the byte-count is computed via
+  // VersionBackend::version_strlen and clamped to
+  // TOOL_NAME_UPPER_MAX (32 bytes) for the uppercase mirror.
+  // "cat" fits trivially; the array is 4 bytes including NUL.
+  // ============================================================================
+  pub let PDX_TOOL_NAME : [u8; 4] = "cat\0"
+
+  // ============================================================================
+  // PDX_TOOL_VERSION — semver + optional suffix, NUL-terminated.
+  // Read by libpdx-argv VersionBackend::emit_default at run time
+  // via `lea rdi, [rip + PDX_TOOL_VERSION]` (segment 1b of the
+  // ENH-032 emit_default body); the byte-count is computed via
+  // VersionBackend::version_strlen. The `-A` suffix marks the
+  // v1.1 substrate-flip milestone family and is emitted as-is;
+  // consumers compare prefix-only per the entry.pdx docstring.
+  //
+  // v1.2.0-A batch (this file's landing wave) closes cat #22, #24,
+  // #25, #28, #32. Keep this literal in lockstep with
+  // entry_version_msg in src/entry.pdx — a mismatch between the
+  // inline `--version` fast path's output and libpdx-argv's
+  // auto-emit output is exactly the ENH-032 regression class.
+  // ============================================================================
+  pub let PDX_TOOL_VERSION : [u8; 8] = "1.2.0-A\0"
+
+}

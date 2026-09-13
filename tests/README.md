@@ -36,6 +36,15 @@ the correctness invariants, not the plumbing.
 | `m4_002_schema_passthrough.pdx`     | #12   | schema-typed passthrough (R20b frame)    | 1..6          |
 | `m4_003_large_file_streaming.pdx`   | #13   | streaming loop + bounded working set     | 1..4          |
 | `m4_004_stdin_pipe.pdx`             | #14   | stdin path + audit-NOT-fired invariant   | 1..4          |
+| `qemu_e2e_cat_smoke.sh`             | #32   | end-to-end serial-log fingerprint (v1.1-A substrate) | 0/1/77 |
+
+Note: `qemu_e2e_cat_smoke.sh` is a bash driver script, not a `.pdx`
+module. It exits 0 on PASS, 1 on FAIL (fingerprint bytes absent),
+and 77 on SKIP (bin_seeds satellite cutover / monorepo checkout
+preconditions unmet — see the script header for the four skip
+gates). It is deliberately outside the M4 correctness matrix
+because it exercises the whole boot → shell → exec → syscall chain
+rather than the module contracts in isolation.
 
 Fail-code codebook per file is the header comment at the top of
 that file.

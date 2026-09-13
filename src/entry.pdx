@@ -244,7 +244,7 @@ module Entry = structure {
   // prefix-only; the "-A" segment is informational. v1.1.1-A adds
   // the ENH-003 stderr diagnostic layer on top of v1.1.0-A.
   // ============================================================================
-  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.1.1-A\n\0"
+  pub let entry_version_msg : [u8; 26] = "cat (paideia-os) 1.2.0-A\n\0"
   pub let entry_version_msg_len : u64 = 25
 
   // ============================================================================

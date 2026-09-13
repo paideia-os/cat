@@ -1,8 +1,30 @@
 // src/argv_dispatch.pdx — cat.M1-001..M1-003 (skeleton) → cat.M2-001..M2-004
-// → cat.M3-001..M3-003
+// → cat.M3-001..M3-003 → v1.1-A retirement → v1.2.0-A (Closes #25)
 // CatDispatch module: argv → parsed flags + positional list → per-
 // file streaming read → (render-text OR semantic-pipe) → TtySink;
 // OR stdin read → render → TtySink when argv has zero positionals.
+//
+// v1.2.0-A retirement note (Closes cat #25 — libpdx-argv migration)
+// -----------------------------------------------------------------
+// cat_parse_argv (the hand-rolled inline byte scanner defined below)
+// is RETIRED in the live path by the v1.1-A substrate flip: _start
+// in src/entry.pdx handles its own argv walk directly (byte-through
+// only — no -n / -A / --schema at v1.1-A) and never calls
+// cat_dispatch or cat_parse_argv. deps.list at v1.2.0-A declares
+// `libpdx-argv >= 1.1.3` and src/tool_ident.pdx defines the
+// PDX_TOOL_NAME + PDX_TOOL_VERSION externs required by the
+// libpdx-argv v1.1.3 VersionBackend::emit_default contract
+// (paideia-os/libpdx-argv #42). The v1.1-C follow-up rewires
+// _start's inline `--version` compare + the future flag-layer
+// resurrection through Parser::parse_argv_ex, at which point the
+// symbols and control paths in THIS module are removable outright
+// alongside the sibling stub cleanups tracked in the tty_sink.pdx
+// header note.
+//
+// Until then, cat_parse_argv / cat_reset / cat_dispatch / the
+// PARSE_ERR_* / FLAG_* / POS_MAX constants below remain in tree so
+// tests/*.pdx (which still reference these symbols but never link
+// into cat.elf) continue to compile.
 //
 // M3 pipeline (extends M2 with audit-first + semantic-pipe layer)
 // ---------------------------------------------------------------

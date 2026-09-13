@@ -46,10 +46,15 @@ Landed so far:
 | ID       | #   | Title                                                          | State  |
 |----------|-----|-----------------------------------------------------------------|--------|
 | ENH-001  | #17 | `_start` + `cat.ld` linker script + linked `cat.elf`            | LANDED (partial — see note) |
+| ENH-002  | #22 | Reconcile with monorepo src/user/cat.pdx: one canonical cat     | LANDED (v1.2.0-A) — resolution: satellite is master per `design/user/in-tree-vs-satellite-transition.md`; in-tree body is Phase-A bin_seeds substrate scheduled for Phase-C retirement |
 | ENH-003  | #23 | stderr diagnostics on open failure / cap denial / I/O error    | LANDED (v1.1.1-A) |
+| ENH-004  | #24 | TtySink 64 KiB output ceiling                                   | LANDED (v1.2.0-A) — removed by v1.1-A substrate flip: live path in `entry.pdx` byte-pumps `sys_read`/`sys_write` in 4 KiB chunks until EOF, no ceiling; `tty_sink.pdx` stub retired dead code |
 | ENH-005  | #20 | Wire `--version`; strip `--help`; fix `--schema` text           | LANDED |
 | ENH-006  | #18 | Correct the libpdx-argv claim in STATUS.md                      | LANDED |
+| ENH-007  | #25 | libpdx-argv migration                                           | LANDED (v1.2.0-A) — deps.list declares `libpdx-argv >= 1.1.3`; `src/tool_ident.pdx` defines `PDX_TOOL_NAME` + `PDX_TOOL_VERSION` externs per Wave 6 hotfix contract; `cat_parse_argv` retired dead code; runtime Parser wire-in deferred to v1.1-C |
 | ENH-009  | #19 | Raise `NAME_MAX_LEN` from 236 to 255                            | LANDED |
+| —        | #28 | v1.1-A real-body extraction (retire M1-001 STUB)                | LANDED (v1.1.0-A; re-affirmed v1.2.0-A) — `entry.pdx` `_start` inlines real `sys_open`/`sys_read`/`sys_write`/`sys_close`; the nine-module dispatch tree is unreachable dead code |
+| —        | #32 | QEMU end-to-end smoke — `cat FOO` prints `FOO` on stdout        | PLACEHOLDER (v1.2.0-A) — `tests/qemu_e2e_cat_smoke.sh` lands; live run blocked on bin_seeds Phase-B cutover (design doc §4) |
 
 **ENH-001 note:** `tools/build.sh` now links every `src/*.o` into
 `build-out/cat.elf` via `src/cat.ld`, and `src/entry.pdx` provides a
@@ -67,12 +72,11 @@ returns 0 → exit 4 for every real path). `--version` and the
 usage-error path are real (no stub involved) because they bypass
 `cat_dispatch` entirely.
 
-Remaining open: ENH-002 (#22, cross-repo canonicalization),
-ENH-004 (#24, 64 KiB sink ceiling — dep now moot on the v1.1-A
-substrate, retracking pending), ENH-007 (#25,
-libpdx-argv migration), ENH-008 (#21, RawByteChunk hash — needs the
+Remaining open: ENH-008 (#21, RawByteChunk hash — needs the
 canonical DDL hash value from libpdx-semantic-pipe, not yet
-researched here).
+researched here). Every other enhancement-wave issue (#22 / #24 /
+#25 / #28 / #32) closed in the v1.2.0-A Wave-B batch — see the
+enhancement-wave table above and CHANGELOG.md v1.2.0-A entry.
 
 ## Substrate posture
 

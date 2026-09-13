@@ -41,4 +41,16 @@
 # and no entries — to remain diffable across the migration.
 
 deps:
-  # (empty at v1.0 — see header note above)
+  # v1.2.0-A batch (Closes #25) — first non-empty dep. libpdx-argv
+  # 1.1.3 is the ENH-032 hotfix release that removed the DOC_TOOL_NAME
+  # hardcoded literal from VersionBackend::emit_default and replaced
+  # it with the PDX_TOOL_NAME + PDX_TOOL_VERSION UND externs (see
+  # paideia-os/libpdx-argv #42). cat's src/tool_ident.pdx satisfies
+  # both externs at final-link time; the runtime wire-in of
+  # Parser::parse_argv (which triggers the auto-emit path) stays a
+  # v1.1-C follow-up so the inline `--version` fast path in
+  # src/entry.pdx remains the source-of-truth emitter at v1.2.0-A.
+  # Declaring the dep now (before the runtime wire-in) means
+  # `pkg install cat` will pre-stage libpdx-argv into the shared-lib
+  # closure so the v1.1-C symbol swap is a rebuild-only landing.
+  - libpdx-argv >= 1.1.3
